@@ -1,0 +1,7 @@
+# Выходы локальных прогонов — артефакты, не исходники.
+smoke.mp4
+plan.mp4
+plan_shot*.png
+lang_*.png
+__pycache__/
+*.pyc

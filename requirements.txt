@@ -1,0 +1,19 @@
+# torch ставится отдельно в Dockerfile (колесо под CUDA) — здесь его быть не
+# должно, иначе pip-резолвер молча откатит версию.
+runpod~=1.7
+diffusers==0.40.0
+# ⚠️ Нижняя граница НЕ косметическая: 5.x требует torch >= 2.5 и при более
+# старом отключает интеграцию с torch молча, а падает потом diffusers с
+# `name 'nn' is not defined`. Проверенная связка (живой прогон 03.09):
+# torch 2.6.0 + transformers 5.16.1 + diffusers 0.40.0 + peft 0.20.
+transformers>=5.0,<6
+accelerate>=1.0
+peft>=0.13
+safetensors>=0.4
+opencv-python-headless==4.10.0.84
+numpy<2
+pillow
+huggingface_hub
+# Отдача готового файла приложению. requests, а не urllib: нужен multipart и
+# внятный таймаут, а тащить httpx ради одного POST незачем.
+requests>=2.31

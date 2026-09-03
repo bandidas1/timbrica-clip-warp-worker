@@ -22,6 +22,10 @@ from PIL import Image
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models/sd15")
 LORA_DIR = os.environ.get("LORA_DIR", "/models/lcm-lora-sdv1-5")
+# Пусто = обычные имена файлов (так лежит кэш HF при локальном прогоне),
+# "fp16" = то, что запечено в образ. Значение по умолчанию берётся от образа,
+# а local_smoke.py его перекрывает пустой строкой.
+MODEL_VARIANT = os.environ.get("MODEL_VARIANT", "fp16") or None
 
 NEG = ("watermark, text, signature, blurry, low quality, jpeg artifacts, "
        "deformed, extra limbs")
@@ -59,8 +63,16 @@ def _load():
     from diffusers import (LCMScheduler, StableDiffusionImg2ImgPipeline,
                            StableDiffusionPipeline)
 
+    # ⚠️⚠️ `variant` обязан совпадать с тем, ЧТО ЗАПЕЧЕНО в образ. Мы кладём
+    # fp16-файлы (`*.fp16.safetensors`, вдвое легче), а загрузчик без этого
+    # параметра ищет обычные имена, не находит, откатывается к `.bin`, не
+    # находит и падает: «Error no file named diffusion_pytorch_model.bin found
+    # in directory /models/sd15/unet». Локально дефект НЕ воспроизводится —
+    # там кэш HF с обычными файлами, — и виден только живым прогоном образа
+    # (замер 04.09: 19.6 минуты холодного старта до этой ошибки).
+    # Меняешь `variant` — меняй allow_patterns в download_models.py, это пара.
     t2i = StableDiffusionPipeline.from_pretrained(
-        MODEL_DIR, torch_dtype=torch.float16,
+        MODEL_DIR, torch_dtype=torch.float16, variant=MODEL_VARIANT,
         safety_checker=None, requires_safety_checker=False)
     t2i.scheduler = LCMScheduler.from_config(t2i.scheduler.config)
     # ⚠️ Порядок: сплавление LoRA на CPU в fp16 идёт МИНУТАМИ при нулевой

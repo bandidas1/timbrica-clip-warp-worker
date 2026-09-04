@@ -1,90 +1,224 @@
-# clip-warp-worker
+# timbrica-clip-warp-worker
 
-RunPod serverless worker that renders a video clip from a text description.
+RunPod serverless **генератор видеоклипа по промпту** — warp-петля Deforum-класса
+на SD 1.5 + LCM. Движок будущего платного тула «клип по описанию / под песню».
 
-The picture is produced frame by frame: each next frame is the previous one,
-nudged by an affine transform and redrawn with img2img. That gives the
-recognisable flowing motion — and also the constraint the worker is built
-around, see **Shots** below.
+Приложение зовёт его через провайдера по образцу
+`App\Services\AiVideo\RunPodPortraitProvider`. **Контракт `handler.py` держать в
+локстепе с провайдером.**
 
-Engine: Stable Diffusion 1.5 + LCM-LoRA (both OpenRAIL-M, commercially usable).
-Weights are baked into the image at build time, so a cold start loads modules
-rather than downloading gigabytes.
+> Кладётся под `services/`, как остальные воркеры (demucs / svc / qwen-tts /
+> liveportrait), зеркалится в `github.com/bandidas1/timbrica-clip-warp-worker`,
+> образ собирает CI в ghcr. Ничего из Laravel-приложения здесь не импортируется.
 
-## Input
+## Почему именно этот движок (решение Фарида 2026-09-03, по замеру)
 
-```jsonc
-{
-  "input": {
-    "prompt": "neon city street at night, rain, reflections",
-    "style": "flow",            // flow | drift | push | orbit
-    "seconds": 60,              // 1..300
-    "fps": 12,                  // 8..15
-    "shot_seconds": 8,          // 4..15, ignored when `shots` is given
-    "size": 512,                // 512 | 640
-    "seed": 12345,              // optional
-    "mark": true,               // AI-provenance metadata, default true
-    "shots": [                  // optional prompt schedule
-      {"prompt": "verse in the city", "seconds": 20},
-      {"prompt": "chorus in space",   "seconds": 40}
-    ],
-    "upload": {                 // optional; without it the mp4 rides inline
-      "url": "https://…/clip/upload",
-      "gen_id": 42, "expires": 1757000000, "sig": "…"
-    }
-  }
+Прогнан bake-off четырёх подходов на одинаковых сценариях — ролики и подробности
+в памяти `reference_clip_generation_bakeoff_2026_09_03`. Итог:
+
+| подход | с/кадр (RTX 4060 8 ГБ) | вердикт |
+|---|---|---|
+| **SD 1.5 + LCM warp-петля, 512px** | **0.93** | ✅ ЕДИНСТВЕННЫЙ прошёл все 4 сценария |
+| AnimateLCM, 512px | 1.57 (на 16 кадрах) | ✅ но клип собирается кусками по 1.3 с |
+| SSD-1B + LCM, 1024px | 3.1 | ⛔ сцена умирает к 45-му кадру |
+| полный SDXL, 768px | 34 | ⛔ в 8 ГБ не влезает, своп |
+| FLUX-класс, 1024px | — | вдесятеро дороже за кадр |
+
+## 💰 Себестоимость — ЗАМЕРЕНА на живой RTX 4090 (03.09.2026)
+
+Прогон `local_smoke.py` на арендованном поде RunPod (RTX 4090 24 ГБ, 450 Вт),
+30 секунд видео / 360 кадров / 5 склеек, стек torch 2.6 + diffusers 0.40:
+
+| | 4060 Laptop 75 Вт | **RTX 4090 450 Вт** |
+|---|---|---|
+| с/кадр | 0.651 | **0.200** |
+| 30 с видео | 235 с | **72.5 с** |
+
+Ускорение **3.26×** — мой предварительный коэффициент 2.5 был ЗАНИЖЕН, реальность
+лучше догадки. Генерация идёт в 2.4× медленнее реального времени.
+
+При serverless-ставке 4090 $1.10/час (0.0275 ₽/GPU-с при 90 ₽/$) плюс холодный
+старт ~40 с:
+
+| клип | кадров | GPU-с | **себестоимость** | ждать |
+|---|---|---|---|---|
+| 1 мин | 720 | 184 | **5 ₽** | 2.5 мин |
+| 3 мин | 2160 | 472 | **13 ₽** | 7.9 мин |
+| 5 мин | 3600 | 760 | **21 ₽** | 12.7 мин |
+
+Neural Frames берёт за трёхминутный клип **~2300 ₽**. Замер стоил $0.10.
+⚠️ Ставка $1.10/час — serverless-прайс; за под мы платили $0.74/час (secure).
+В расчёт лейна идёт serverless, потому что там он и будет жить.
+
+## 🏷️ Цена и кап — решено, и вот из чего
+
+**Кап `daily_runs` здесь быть НЕ ДОЛЖНО** — это не мой выбор, а инвариант
+проекта: токенный лейн и суточный кап несовместимы (`ToolDailyCapMirrorTest`).
+Ограничитель — кошелёк. В `config/server-lane.php` тул идёт с `own_meter: true`,
+как TTS/ASR/stem-split: центральный гейт его пропускает, потому что он метерит
+себя сам.
+
+**Цена** (1 токен ≈ 0.0124 ₽ по пакету 99 ₽ = 8000 токенов):
+
+| клип | токенов | ≈ ₽ | себестоимость прогона | кратность |
+|---|---|---|---|---|
+| 1 мин | 8 000 | 99 ₽ | 5 ₽ | 19.0× |
+| 3 мин | 20 000 | 248 ₽ | 13 ₽ | 18.9× |
+| 5 мин | 32 000 | 396 ₽ | 21 ₽ | 18.8× |
+
+⚠️ Ставка удвоена 04.09 (решение Фарида): было `1000 + 50 × с`, стало
+`2000 + 100 × с`. Довод не в себестоимости прогона — колонка выше это ТОЛЬКО
+GPU-секунды. Она не покрывает ни зарезервированную мощность serverless-эндпойнта,
+ни разработку лейна, а на пусковых объёмах постоянная часть и есть настоящая
+стоимость. Кратность к per-run себестоимости при этом вдвое выше домашнего
+ориентира (`/storyboard-maker` 5.9×) — осознанный размен, не потерянный ноль.
+
+Прогон занимает 8–13 минут живого GPU, и его надо переживать вместе с провалами
+и очередью. Ставка всё равно оставляет нас **примерно в 9 раз дешевле Neural
+Frames** (~2300 ₽ за трёхминутный клип против наших 248 ₽).
+
+## ⚖️ Пометка «это ИИ» — не опция, а условие (EU AI Act ст. 50(2))
+
+Вывод генеративной системы обязан нести машинно-читаемую пометку; для нового
+инструмента это действует с первого дня, а intl-домен обслуживает ЕС.
+
+**Метим ЗДЕСЬ, в воркере, и вот почему:** файл рождается на сервере и отдаётся
+пользователю с нашего диска (в т.ч. из «Моих генераций»), а там JavaScript не
+выполняется — та же причина, по которой появился
+`App\Services\Media\AiContentMarker`. Поля совпадают с браузерным
+`public/js/ai-mark.js`, чтобы файл, помеченный любой стороной, выглядел одинаково.
+
+⚠️ Заметка для следующего: в `services/liveportrait-worker/handler.py` написано,
+будто «ai-mark.js пропускает MP4 нетронутым». **Это неправда** — проверено
+03.09.2026: `markMp4` вставляет `©cmt`/`©too` в `moov>udta>meta>ilst`, правит
+таблицы `stco/co64` и умеет случай уже существующего тега ffmpeg. Метить в
+воркере всё равно правильно (см. выше), но обоснование там устарело.
+
+⚠️ Пометка в метаданных срезается перекодированием. Закон требует «насколько
+технически осуществимо», и для запуска этого достаточно. Но если тул когда-нибудь
+начнёт оживлять фотографии РЕАЛЬНЫХ людей — это уже ст. 50(4), дипфейки, и там
+нужно ВИДИМОЕ раскрытие, а не только метаданные.
+
+## Контракт
+
+```
+IN  input = {
+  prompt:       "<english scene text>",    # приложение переводит через EnglishPrompt
+  style:        "flow" | "drift" | "push" | "orbit",   # набор параметров движения
+  seconds:      1..300,                    # предел = верхний тариф; транспорт — см. ниже
+  fps:          8..15,                     # генерируемых кадров в секунду
+  shot_seconds: 4..15,                     # как часто ПЕРЕСТАВЛЯТЬ композицию (умолчание)
+  shots:        [{prompt, seconds}, …],    # расписание сцен; приложение ставит границы НА ДОЛИ песни
+  width, height: пара из ALLOWED_SIZES,    # 512×512 · 432×768 (9:16) · 768×432 (16:9) + пробы
+  out:          [W, H] | null,             # во что масштабировать выданный файл (Canvas: 720×1280)
+  size:         512 | 640,                 # ⚠️ устаревшее: квадрат; width/height сильнее
+  seed:         int | null,
+  strength:     0.30..0.60 | null,         # переопределить силу стиля
+  mark:         true                       # пометка ИИ, по умолчанию включена
 }
+OUT {
+  stored/bytes/sha256 (расписка, см. _deliver) либо mp4_b64 для коротких проб,
+  width, height (ВЫДАННОГО файла), render_width, render_height, fps, n_frames,
+  seconds, shots, seed, gen_seconds, sec_per_frame, timings: { first_frames, loop, encode }
+}
+err { error: "bad_prompt" | "bad_seconds" | "bad_style" | "encode_failed" | "<reason>" }
+     # приложение маппит ЛЮБУЮ ошибку в полный возврат токенов
 ```
 
-## Output
+## ⚠️ Формат кадра и пробы — образ надо ПЕРЕСОБРАТЬ (04.09.2026)
 
-With `upload` — a receipt (the file is POSTed to the given URL):
+`handler.py` теперь принимает `width`/`height`/`out` и проверяет пару по
+`ALLOWED_SIZES`. Два следствия:
 
-```json
-{"stored": true, "bytes": 8123456, "sha256": "…", "seconds": 60.0, "shots": 8,
- "gen_seconds": 145.2, "sec_per_frame": 0.2, "fps": 12, "n_frames": 720}
-```
+1. **Старый образ не умеет 9:16 и 16:9** — он знает только `size ∈ {512, 640}`.
+   Приложение шлёт И `size`, И `width/height`, поэтому до пересборки старый
+   образ молча рисует квадрат для любого формата. Лейн ещё не открыт, значит
+   пересборка обязана случиться ДО флипа тула в public — иначе человек, выбравший
+   вертикальный клип, через восемь минут получит квадрат.
+2. **Проба раньше не работала ВООБЩЕ**: приложение слало `size: 384`, старый
+   образ отвечал `bad_params`. То есть бесплатная проба — функция, которой мы
+   бьём главную жалобу рынка, — не могла отработать ни разу. Теперь пробы трёх
+   форм (384², 288×512, 512×288) в белом списке.
 
-Without `upload` — the same metrics plus `mp4_b64`. Inline delivery is capped
-(`INLINE_MAX_BYTES`, default 6 MiB): base64 inflates bytes by a third, and a
-long clip does not fit a serverless result payload. That is what `upload` is for.
+Проверка после пересборки — `local_smoke.py` с `--width 432 --height 768`, и
+сверка `ALLOWED_SIZES` с `config/ai-video.php → aspects` (сторож
+`ClipGeneratorLaneTest::test_aspects_match_the_worker`).
 
-On failure: `{"error": "…"}`. The caller is expected to treat any error as a
-full refund — nothing is delivered.
+## Три вещи, которые нельзя выкинуть при рефакторинге
 
-## Shots — why a long clip is cut into scenes
+Все три — из замера, а не из вкуса. Убери любую, и результат станет заметно хуже
+БЕЗ единой ошибки в логе.
 
-The zoom of the warp loop **accumulates**. At a modest 0.6% per frame the camera
-doubles the image in nine seconds; over three minutes it would end up inside a
-tiny detail. So the worker restarts the composition (a fresh txt2img frame) at
-every shot boundary, and each shot gets its own colour anchor. Without this a
-long clip is not merely worse — it is unusable.
+1. **`shot_seconds` — перестановка композиции.** Зум 0.6% на кадр за 8.7 секунды
+   даёт увеличение в 2.2 раза: в тесте «портрет» камера к 130-му кадру оказалась
+   ВНУТРИ ГЛАЗА. За 3 минуты это тысячи крат. Непрерывной петлёй длинный клип
+   снять нельзя физически — нужны склейки. (Это же Neural Frames называет
+   «расписанием промптов».) Приложение будет ставить склейки на биты песни.
+2. **Коррекция цвета к первому кадру ШОТА.** Без неё палитра за сотню итераций
+   уползает в сепию. Сбрасывать на каждой склейке, иначе новый шот тянет цвет
+   предыдущего.
+3. **Эффективные шаги = `steps` × `strength`.** Пайплайн запускает не все шаги, а
+   долю силы от них. При силе 0.28 и шести шагах модель получает 1.7 шага и выдаёт
+   постеризованные пятна, которые петля усиливает — то есть понижение силы БЕЗ
+   подъёма шагов делает картинку ХУЖЕ, а не стабильнее. `_steps_for()` держит
+   эффективные шаги, а не номинальные.
 
-`shots` lets the caller place those boundaries and give each stretch its own
-prompt. The plan is **truncated to the requested clip length**, never extended.
+И одна ловушка сборки: **LoRA сплавлять только ПОСЛЕ `.to("cuda")`.** На CPU в
+fp16 это идёт минутами при нулевой загрузке GPU и выглядит как зависание, без
+единой ошибки.
 
-## Notes that cost time to learn
+## Лицензии (проверено 2026-09-03)
 
-* **Frames are streamed to ffmpeg as they are produced.** Accumulating them and
-  encoding at the end works in a test and dies at the target: 2160 frames of
-  512×512 are ~1.7 GB of live bytes.
-* **In img2img what matters is `steps × strength`.** The pipeline runs only a
-  `strength` fraction of the steps, so lowering strength without raising steps
-  starves the model instead of stabilising it.
-* **Colour drifts** across an img2img chain; each shot is re-anchored to the
-  LAB statistics of its own first frame.
-* **torch 2.6+ is required.** `transformers` 5.x silently disables its torch
-  integration on older torch, and what then fails is `diffusers`, with
-  `name 'nn' is not defined` — an error that names neither the culprit nor the
-  versions.
+- **dreamshaper-8** (SD 1.5) — CreativeML OpenRAIL-M, коммерческое использование
+  разрешено. **lcm-lora-sdv1-5** — OpenRAIL-M.
+- ⛔ **НЕ брать:** SDXL-Turbo, FLUX.1-dev, Freepik/flux.1-lite — non-commercial,
+  на платном продукте запрещены. FLUX.1-schnell при Apache-2.0 закрыт
+  gated-репозиторием (401 без HF-аккаунта); открытый потомок —
+  `shuttleai/shuttle-3-diffusion`, Apache-2.0, если понадобится лейн «дорогое
+  качество».
 
-## Build
+## Мощности RunPod
 
-CI builds and pushes to GHCR on every push to `main`
-(`ghcr.io/bandidas1/timbrica-clip-warp-worker:latest`).
+Потолок аккаунта `maxServerlessConcurrency` = **10**. 03.09.2026 у
+`liveportrait-animate` выставлен `workersMax=0` (тул `/photo-animate` скрыт с
+17.07, 9 задач за всё время) → освободился 1 слот, стало 9 из 10. Этого хватает
+на ЗАМЕР. Перед запуском лейна — просить RunPod поднять потолок, это бесплатно
+по запросу. ⛔ `timbrica-video-upscale` не трогать: обслуживает публичный тул
+(его 73.6% брака — отдельная задача,
+`tests/scratch/task-video-upscaler-failures.md`).
 
-## Local run without Docker
+## ⬜ Транспорт длинного файла — решение есть, нужно подтверждение
 
-`local_smoke.py` in the parent project runs `handler()` directly with a stub for
-the `runpod` module — useful for checking the loop and the shot schedule on a
-desktop GPU.
+Сейчас результат едет инлайном в base64: хватает на замер (клип 30 с ≈ 8 МБ),
+но 3–5 минут это 10–40 МБ, а base64 раздувает их ещё на треть.
+
+**Проверено 2026-09-03, а не предположено:**
+- объектного хранилища у нас НЕТ ни на одном шарде — `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_BUCKET`, `AWS_ENDPOINT` пусты, диск `s3` в
+  `config/filesystems.php` — это дефолтная заготовка Laravel;
+- зато **наш собственный приём файла уже настроен на 512 МБ**: nginx
+  `client_max_body_size 512M` на обоих фронтах (`infra/nginx/`), FPM
+  `php_admin_value[post_max_size] = 512M` и `upload_max_filesize = 512M`.
+  Живое подтверждение — серверный лейн уже принимает 100 МБ
+  (`config/server-lane.php` → `video-compressor.max_mb`).
+
+**Поэтому рекомендация — не поднимать хранилище, а дать воркеру отдать файл НАМ:**
+воркер по завершении POST'ит mp4 на внутренний маршрут с общим секретом и id
+задачи, приложение кладёт его на приватный диск, воркер возвращает инлайном
+только `{stored: true, bytes, sha256}`. Ни нового вендора, ни новой платы, ни
+второго места, где живут файлы, — и файл сразу оказывается там, где обязан быть
+для «Моих генераций». Маршрут обязан нести аутентификацию по секрету, троттлинг
+и проверку sha256; пометка ИИ при этом уже стоит (её ставит воркер).
+
+⚠️ Отвергнутые варианты и почему: **сетевой том RunPod** не отдаётся по HTTP
+без поднятого пода, то есть требует второй сущности; **нарезка на части с
+поклейкой в приложении** добавляет состояние и точку отказа ровно там, где
+списаны токены.
+
+⬜ Требует твоего «да»: открытие внутреннего upload-маршрута — это входная дверь
+на прод, и её появление я без подтверждения не делаю.
+
+Прочее открытое: кап и цена (решение Фарида, до кода — правило CLAUDE.md),
+`retention.kinds` + блок в «Моих генерациях» (обязателен, файл живёт у нас),
+библиотека стилей с превью (примеры обязаны быть сгенерированы ТОЙ ЖЕ
+конфигурацией, что запустится).

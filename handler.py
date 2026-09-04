@@ -8,6 +8,7 @@
 """
 import base64
 import gc
+import io
 import hashlib
 import os
 import subprocess
@@ -44,6 +45,18 @@ STYLES = {
 # файла приложению (см. `_deliver`) ограничение сняли до 5 минут — верхнего
 # тарифного тира. Выше не надо: 5 минут это уже ~13 минут живого GPU.
 MAX_SECONDS = int(os.environ.get("MAX_SECONDS", 300))
+
+# Разрешённые размеры кадра — зеркало config/ai-video.php → tools.clip-generator
+# .aspects (w × h). Квадрат, 9:16 и 16:9. 640×640 остаётся из прежнего контракта.
+# ⚠️⚠️ Пробы ОБЯЗАНЫ быть в этом списке. До 04.09 его не было вовсе, а проверка
+# гласила `size not in (512, 640)` — и проба, которую приложение шлёт размером
+# 384, отвергалась с `bad_params` КАЖДЫЙ раз. Функция, которой мы бьём главную
+# жалобу рынка («платишь до того, как увидишь»), не могла отработать ни разу.
+ALLOWED_SIZES = {
+    (512, 512), (640, 640),          # квадрат (640 — из прежнего контракта)
+    (432, 768), (768, 432),          # 9:16 и 16:9
+    (384, 384), (288, 512), (512, 288),   # пробы тех же трёх форм
+}
 
 # Потолок инлайн-выдачи. Ниже настоящего предела RunPod с запасом: base64
 # раздувает байты на треть, и упереться в предел ПОСЛЕ прогона — значит выбросить
@@ -96,6 +109,17 @@ def _steps_for(strength: float) -> int:
     return max(int(round(EFF_STEPS / max(strength, 0.05))), 4)
 
 
+def _cover(img, w, h):
+    """Кроп «cover» под кадр: масштаб по большей стороне, срез по центру.
+    Растянуть нельзя — обложка узнаваема только с сохранённой пропорцией."""
+    sw, sh = img.size
+    scale = max(w / sw, h / sh)
+    nw, nh = max(w, int(round(sw * scale))), max(h, int(round(sh * scale)))
+    img = img.resize((nw, nh), Image.LANCZOS)
+    left, top = (nw - w) // 2, (nh - h) // 2
+    return img.crop((left, top, left + w, top + h))
+
+
 def _warp(img, zoom, angle, tx, ty):
     h, w = img.shape[:2]
     m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, zoom)
@@ -135,13 +159,24 @@ class _Encoder:
     moov>udta>meta>ilst, то есть в тот же атом.
     """
 
-    def __init__(self, w, h, fps, mark):
+    def __init__(self, w, h, fps, mark, out=None):
+        """`out` = (W, H) — во что масштабировать готовый кадр, или None.
+
+        ⚠️ Масштабирование делает ffmpeg, а не диффузия: рисовать 720×1280 SD 1.5
+        не умеет (дублирует объекты), а площадки требуют именно такой высоты —
+        Spotify Canvas отклоняет всё ниже 720 px. Апскейл lanczos на выходе
+        стоит доли процента времени прогона и не трогает петлю.
+        ⚠️ Пропорция сохраняется точно: `out` берётся из config/ai-video.php,
+        где стороны подобраны так, что 432×768 → 720×1280 это ровно ×1.666.
+        """
         self.path = tempfile.mktemp(suffix=".mp4")
         cmd = ["ffmpeg", "-y", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
-               "-r", str(fps), "-i", "pipe:",
-               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "high",
-               "-crf", "18", "-preset", "veryfast", "-movflags", "+faststart"]
+               "-r", str(fps), "-i", "pipe:"]
+        if out and (int(out[0]), int(out[1])) != (int(w), int(h)):
+            cmd += ["-vf", f"scale={int(out[0])}:{int(out[1])}:flags=lanczos"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "high",
+                "-crf", "18", "-preset", "veryfast", "-movflags", "+faststart"]
         if mark:
             cmd += ["-metadata", "comment=AI-generated video (Timbrica clip generator)",
                     "-metadata", "synopsis=digitalsourcetype=trainedAlgorithmicMedia",
@@ -282,14 +317,53 @@ def handler(event):
         seconds = float(inp.get("seconds", 8))
         fps = int(inp.get("fps", 12))
         shot_seconds = float(inp.get("shot_seconds", 8))
+        # ⚠️ `size` (квадрат) остаётся ради совместимости: провайдер шлёт
+        # width/height, но старый вызов не имеет права сломаться.
         size = int(inp.get("size", 512))
+        width = int(inp.get("width", size))
+        height = int(inp.get("height", size))
+        out_size = inp.get("out")
+        out_size = ((int(out_size[0]), int(out_size[1]))
+                    if isinstance(out_size, (list, tuple)) and len(out_size) == 2 else None)
     except (TypeError, ValueError):
         return {"error": "bad_params"}
 
     if not (1 <= seconds <= MAX_SECONDS):
         return {"error": "bad_seconds"}
-    if not (8 <= fps <= 15) or size not in (512, 640) or not (4 <= shot_seconds <= 15):
+    if not (8 <= fps <= 15) or not (4 <= shot_seconds <= 15):
         return {"error": "bad_params"}
+    # ⚠️⚠️ Белый список, а не диапазон. Стороны обязаны быть кратны 16 (иначе
+    # VAE роняет размерность) и не уходить от 512 дальше одной ступени: на
+    # 576×1024 SD 1.5 начинает дублировать объекты — «две головы» вместо кадра.
+    # Здесь стоят ровно те пары, что объявлены в config/ai-video.php → aspects;
+    # расхождение ловит ClipGeneratorLaneTest.
+    if (width, height) not in ALLOWED_SIZES:
+        return {"error": "bad_params"}
+    if out_size is not None and not (64 <= out_size[0] <= 2048 and 64 <= out_size[1] <= 2048):
+        return {"error": "bad_params"}
+
+    # Стартовая картинка (обложка альбома, фото). Каждая сцена начинается с НЕЁ,
+    # перерисованной под промпт и вид, — а не с кадра, нарисованного по тексту.
+    # Для музыканта это главный сценарий: у каждого релиза есть обложка.
+    # ⚠️ Кроп под кадр здесь, а не в приложении: приложение уменьшает до ~768 px
+    # ради веса запроса, а точную форму знает только эта пара width×height.
+    init_img = None
+    b64 = inp.get("init_image_b64")
+    if b64:
+        try:
+            raw = base64.b64decode(b64, validate=True)
+            if len(raw) > 6 * 1024 * 1024:
+                return {"error": "bad_image"}
+            init_img = _cover(Image.open(io.BytesIO(raw)).convert("RGB"), width, height)
+        except Exception:
+            return {"error": "bad_image"}
+    try:
+        init_strength = float(inp.get("init_strength", 0.58))
+    except (TypeError, ValueError):
+        return {"error": "bad_params"}
+    # Ниже 0.35 картинка почти не меняется (нет движения между сценами), выше
+    # 0.8 обложка узнаётся только по цвету — то есть теряется смысл входа.
+    init_strength = max(0.35, min(0.80, init_strength))
 
     if inp.get("strength") is not None:
         try:
@@ -326,7 +400,7 @@ def handler(event):
     shots = 0
 
     t0 = time.time()
-    enc = _Encoder(size, size, fps, mark)
+    enc = _Encoder(width, height, fps, mark, out_size)
     try:
         for i in range(total):
             # Начало шота: композиция ставится ЗАНОВО. Без этого зум за минуты
@@ -335,10 +409,19 @@ def handler(event):
                 shots += 1
                 g = torch.Generator("cuda").manual_seed(seed + shots * 7919)
                 ts = time.time()
-                img = t2i(prompt=frame_prompts[i], negative_prompt=NEG,
-                          num_inference_steps=4,
-                          guidance_scale=1.5, width=size, height=size,
-                          generator=g).images[0]
+                if init_img is not None:
+                    # Сцена стартует с обложки, перерисованной под её промпт.
+                    # Шаги — эффективные (см. _steps_for): при силе 0.58 и
+                    # четырёх номинальных шагах модель получила бы два.
+                    img = i2i(prompt=frame_prompts[i], negative_prompt=NEG,
+                              image=init_img, strength=init_strength,
+                              num_inference_steps=_steps_for(init_strength),
+                              guidance_scale=1.5, generator=g).images[0]
+                else:
+                    img = t2i(prompt=frame_prompts[i], negative_prompt=NEG,
+                              num_inference_steps=4,
+                              guidance_scale=1.5, width=width, height=height,
+                              generator=g).images[0]
                 t_first += time.time() - ts
                 cur = np.array(img)
                 ref = _lab_stats(cur)          # цветовой якорь СВОЙ у каждого шота
@@ -371,7 +454,13 @@ def handler(event):
 
     gen = time.time() - t0
     metrics = {
-        "width": size, "height": size, "fps": fps,
+        # Размер ВЫДАННОГО файла, а не рисованного кадра: при апскейле это
+        # разные числа, и приложение подписывает результат по этому полю.
+        "width": (out_size[0] if out_size else width), "height": (out_size[1] if out_size else height),
+        "render_width": width, "render_height": height, "fps": fps,
+        # Сид уезжает наружу ради «того же образа»: без него повторный прогон
+        # рисует другой мир, и клип нельзя доработать, только переиграть.
+        "seed": seed,
         "n_frames": total, "seconds": round(total / fps, 2), "shots": shots,
         "gen_seconds": round(gen, 1),
         "sec_per_frame": round(float(np.median(per_frame)), 3) if per_frame else None,

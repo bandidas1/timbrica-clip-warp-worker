@@ -13,9 +13,13 @@ import base64
 import gc
 import io
 import hashlib
+import math
 import os
+import queue
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 import cv2
@@ -75,8 +79,57 @@ EFF_STEPS = float(os.environ.get("EFF_STEPS", 3.5))
 BIG_OUT_AREA = 1080 * 1080
 BIG_OUT_MAXRATE = "10M"
 BIG_OUT_BUFSIZE = "20M"
+# Очередь кадров к кодировщику (см. _Encoder): ~4 с при 12 к/с, ~1 МБ на кадр.
+QUEUE_FRAMES = int(os.environ.get("QUEUE_FRAMES", 48))
 
 _PIPES = {"t2i": None, "i2i": None}
+
+
+def _cpu_budget():
+    """Сколько ядер контейнеру ДАЛИ, а не сколько он ВИДИТ.
+
+    ⚠️⚠️ Контейнер RunPod видит все ядра хоста, а выделено ему 16 vCPU
+    (`/v2/pods/{id}` → gpu.vcpuCount, 4090, 24.10). x264 с `threads=auto`
+    (1.5 × видимых) и OpenCV (по потоку на видимое ядро) заводят потоки на
+    чужие ядра, квота cgroup их душит — и вместе с ними поток, который кормит
+    GPU. Отсюда разброс живого A/B: тот же прогон +7 % и +37 %.
+    """
+    seen = os.cpu_count() or 1
+    try:
+        aff = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        aff = seen
+    quota = None
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:          # cgroup v2
+            q, p = f.read().split()[:2]
+            if q != "max":
+                quota = int(q) / int(p)
+    except (OSError, ValueError):
+        try:                                                # cgroup v1
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+                q = int(f.read())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+                p = int(f.read())
+            if q > 0:
+                quota = q / p
+        except (OSError, ValueError):
+            pass
+    budget = aff if quota is None else max(1, min(aff, int(math.ceil(quota))))
+    return budget, {"visible": seen, "affinity": aff,
+                    "quota": round(quota, 2) if quota else None, "budget": budget}
+
+
+CPU_BUDGET, CPU_INFO = _cpu_budget()
+# OpenCV: не больше 4 потоков. Кадр 432×768 — миллисекунды и в один поток, а
+# сотня потоков на чужие ядра — это троттлинг. На байты не влияет (проверено
+# 24.10: warpAffine LANCZOS/LINEAR, LAB, addWeighted при 1/2/4/8/32 потоках
+# дают один и тот же результат).
+cv2.setNumThreads(max(1, min(4, CPU_BUDGET)))
+# x264 у новых выходов: бюджет минус два ядра петле (Python + драйвер CUDA),
+# не больше 8 — для 12 к/с 1080p это с запасом (замер: 4 логических ядра
+# ноутбука — 70 к/с выхода 1080×1920).
+ENC_THREADS = max(2, min(8, CPU_BUDGET - 2))
 
 
 # --------------------------------------------------------------------- движок
@@ -202,8 +255,9 @@ class _Encoder:
     moov>udta>meta>ilst, то есть в тот же атом.
     """
 
-    def __init__(self, w, h, fps, mark, out=None):
+    def __init__(self, w, h, fps, mark, out=None, threads=None):
         """`out` = (W, H) — во что масштабировать готовый кадр, или None.
+        `threads` — потолок потоков x264 (None — как раньше, решает ffmpeg).
 
         ⚠️ Масштабирование делает ffmpeg, а не диффузия: рисовать 720×1280 SD 1.5
         не умеет (дублирует объекты), а площадки требуют именно такого размера —
@@ -230,20 +284,67 @@ class _Encoder:
             # прижат к ~10.3 Мбит/с → 5 минут ≤ ~390 МБ. 720×1280 и меньше —
             # побайтно как раньше: там 5 минут ≈ 190 МБ.
             cmd += ["-maxrate", BIG_OUT_MAXRATE, "-bufsize", BIG_OUT_BUFSIZE]
+        if threads:
+            # Только у новых выходов (2·fps, от 1080²): число потоков x264 меняет
+            # байты потока, а прежние выходы обязаны остаться побайтно прежними.
+            cmd += ["-threads", str(int(threads))]
         cmd += ["-movflags", "+faststart"]
         if mark:
             cmd += ["-metadata", "comment=AI-generated video (Timbrica clip generator)",
                     "-metadata", "synopsis=digitalsourcetype=trainedAlgorithmicMedia",
                     "-metadata", "encoder_tool=Timbrica AI tools"]
         cmd += [self.path]
+        # ⚠️ Кодировщик уступает ядро петле: GPU простаивает, пока Python не
+        # подал следующий кадр, а ffmpeg догонит в паузах диффузии. `nice`
+        # префиксом, а не preexec_fn: тот небезопасен при живых потоках, а
+        # у runpod-обвязки они есть всегда. На байты потока не влияет.
+        if os.name == "posix" and shutil.which("nice"):
+            cmd = ["nice", "-n", "10"] + cmd
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE)
+        # ⚠️⚠️ Кадры в трубу пишет ОТДЕЛЬНЫЙ поток через ограниченную очередь.
+        # Труба — 64 КБ, и при прямой записи петля стояла каждый раз, когда x264
+        # набирал кадры пачкой (lookahead, потоки кадров): живой A/B 24.10 на
+        # 4090 — 24 к/с 1080p удлиняли кадр петли на 7–37 %. Очередь держит
+        # QUEUE_FRAMES кадров кадра генерации (~1 МБ каждый при 432×768) —
+        # память ограничена, а рывки кодировщика больше не стопорят GPU.
+        self.t_blocked = 0.0
+        self._err = None
+        self._q = queue.Queue(maxsize=QUEUE_FRAMES)
+        self._pump = threading.Thread(target=self._drain_to_pipe, daemon=True)
+        self._pump.start()
+
+    def _drain_to_pipe(self):
+        try:
+            while True:
+                f = self._q.get()
+                if f is None:
+                    return
+                self.proc.stdin.write(f.tobytes())
+        except Exception as exc:                 # ffmpeg умер — труба закрыта
+            self._err = exc
+            while self._q.get() is not None:     # не держим петлю на полной очереди
+                pass
 
     def write(self, frame):
-        self.proc.stdin.write(frame.tobytes())
+        if self._err is not None:
+            raise RuntimeError(f"encode_pipe: {type(self._err).__name__}")
+        t = time.time()
+        self._q.put(frame)          # кадр больше не меняется: копия не нужна
+        self.t_blocked += time.time() - t
 
     def finish(self):
+        self._q.put(None)
+        self._pump.join()
+        if self._err is not None:
+            # Причина — в stderr ffmpeg, а не в BrokenPipe: её и показываем.
+            try:
+                self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            rc = self.proc.wait(timeout=60)
+            raise RuntimeError(f"encode_failed_{rc}: {self.proc.stderr.read()[-300:]!r}")
         self.proc.stdin.close()
         rc = self.proc.wait(timeout=300)
         if rc != 0:
@@ -255,16 +356,23 @@ class _Encoder:
         return data
 
     def close(self):
-        """Уборка на любом пути выхода — ffmpeg не должен пережить хендлер."""
+        """Уборка на любом пути выхода — ни ffmpeg, ни поток-насос не должны
+        пережить хендлер: воркер живёт десятки заданий, и утёкший поток на
+        каждом упавшем — это утечка, которую видно только через сутки."""
         try:
             if self.proc.poll() is None:
-                try:
-                    self.proc.stdin.close()
-                except (OSError, ValueError):
-                    pass
-                self.proc.kill()
+                self.proc.kill()        # насос, пишущий в трубу, получит ошибку
                 self.proc.wait(timeout=10)
         except Exception:
+            pass
+        try:
+            self._q.put(None, timeout=5)    # после finish() лишний None безвреден
+        except Exception:
+            pass
+        self._pump.join(timeout=5)
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
             pass
         try:
             os.unlink(self.path)
@@ -480,8 +588,13 @@ def handler(event):
     shots = 0
     frames_out = 0
 
+    # Новые выходы (2·fps или от 1080²) — с потолком потоков x264; прежние —
+    # прежней командой, побайтно.
+    big = out_size is not None and out_size[0] * out_size[1] >= BIG_OUT_AREA
+    enc_threads = ENC_THREADS if (double or big) else None
+
     t0 = time.time()
-    enc = _Encoder(width, height, fps_out, mark, out_size)
+    enc = _Encoder(width, height, fps_out, mark, out_size, threads=enc_threads)
     try:
         for i in range(total):
             # Начало шота: композиция ставится ЗАНОВО. Без этого зум за минуты
@@ -575,8 +688,12 @@ def handler(event):
         # видно по ответу, а не по жалобе.
         "fps_out": fps_out, "frames_out": frames_out,
         "react": react, "hits_used": len(hits),
+        # write — сколько петля простояла на полной очереди к кодировщику:
+        # ненулевое значение = кодировщик не успевает и тормозит GPU.
         "timings": {"first_frames": round(t_first, 1), "loop": round(t_loop, 1),
-                    "encode": round(t_encode, 1), "interp": round(t_interp, 1)},
+                    "encode": round(t_encode, 1), "interp": round(t_interp, 1),
+                    "write": round(enc.t_blocked, 1)},
+        "cpu": dict(CPU_INFO, enc_threads=enc_threads),
     }
 
     upload = inp.get("upload")

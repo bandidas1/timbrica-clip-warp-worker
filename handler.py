@@ -5,6 +5,9 @@
   · склейки каждые shot_seconds — иначе композиция уползает и клип невозможен;
   · коррекция цвета к первому кадру ШОТА — иначе палитра уходит в сепию;
   · эффективные шаги = steps × strength — иначе картинка постеризуется.
+
+Математика движения (пульс под музыку, середина шага для 24 к/с) — в motion.py:
+её проверяет motion_selftest.py там, где нет ни видеокарты, ни весов.
 """
 import base64
 import gc
@@ -20,6 +23,8 @@ import numpy as np
 import runpod
 import torch
 from PIL import Image
+
+import motion
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models/sd15")
 LORA_DIR = os.environ.get("LORA_DIR", "/models/lcm-lora-sdv1-5")
@@ -64,6 +69,13 @@ ALLOWED_SIZES = {
 INLINE_MAX_BYTES = int(os.environ.get("INLINE_MAX_BYTES", 6 * 1024 * 1024))
 EFF_STEPS = float(os.environ.get("EFF_STEPS", 3.5))
 
+# Выход от этой площади (1080×1080 и больше) кодируется с потолком битрейта —
+# см. _Encoder. 1280×720 (921 600) ниже порога намеренно: прежние размеры
+# выхода кодируются ровно той командой, что и до 24.10.
+BIG_OUT_AREA = 1080 * 1080
+BIG_OUT_MAXRATE = "10M"
+BIG_OUT_BUFSIZE = "20M"
+
 _PIPES = {"t2i": None, "i2i": None}
 
 
@@ -105,8 +117,9 @@ def _load():
 
 
 def _steps_for(strength: float) -> int:
-    """Держим ЭФФЕКТИВНЫЕ шаги: img2img запускает только долю strength от них."""
-    return max(int(round(EFF_STEPS / max(strength, 0.05))), 4)
+    """Держим ЭФФЕКТИВНЫЕ шаги: img2img запускает только долю strength от них.
+    Формула живёт в motion.steps_for — кривые движения считают шаги той же."""
+    return motion.steps_for(strength, EFF_STEPS)
 
 
 def _cover(img, w, h):
@@ -127,6 +140,36 @@ def _warp(img, zoom, angle, tx, ty):
     m[1, 2] += ty
     return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LANCZOS4,
                           borderMode=cv2.BORDER_REFLECT_101)
+
+
+def _mid_frame(prev, cur, zoom, angle, tx, ty):
+    """Кадр ровно посередине шага петли — для `fps_out` = 2 × fps.
+
+    Мы ЗНАЕМ, какой аффинкой кадр cur получен из prev (её же строил `_warp`),
+    поэтому середина — это prev, сдвинутый на «половину» шага (A, где A∘A = M),
+    и cur, отведённый назад на ту же половину, смешанные пополам. Геометрия
+    обеих половин совпадает, и смешение — это смена текстуры img2img, а не
+    двойной контур.
+
+    ⚠️⚠️ Почему не фильтр ffmpeg (замер 24.10 на настоящих кадрах петли, README):
+      · minterpolate mci — ~8.8 к/с входа на ОДНОМ ядре ноутбука i9 (фильтр
+        однопоточный), то есть на ядре сервера он медленнее генерации (~6 к/с)
+        и тормозил бы весь прогон; к тому же теряет кадры (189 из 192);
+      · framerate (смешение) — двойной контур на каждом втором кадре;
+      · оба фильтра на тёмной склейке (неон → неон) НЕ видят смену сцены и
+        рисуют кашу из двух сцен на месте жёсткой склейки.
+    Здесь: 1 мс на кадр, точность выше mci (PSNR +0.2…0.35 дБ, когда кадр
+    петли выброшен и восстановлен), а склейки знаем из плана, а не угадываем.
+    INTER_LINEAR, а не LANCZOS: середина — смесь двух кадров, резкость ей не
+    прибавляется, а мерка с LANCZOS дала даже чуть хуже при 7× цене.
+    """
+    h, w = prev.shape[:2]
+    a = np.array(motion.half_affine(w, h, zoom, angle, tx, ty), dtype=np.float64)
+    fwd = cv2.warpAffine(prev, a, (w, h), flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REFLECT_101)
+    bwd = cv2.warpAffine(cur, a, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                         borderMode=cv2.BORDER_REFLECT_101)
+    return cv2.addWeighted(fwd, 0.5, bwd, 0.5, 0)
 
 
 def _lab_stats(img):
@@ -176,7 +219,18 @@ class _Encoder:
         if out and (int(out[0]), int(out[1])) != (int(w), int(h)):
             cmd += ["-vf", f"scale={int(out[0])}:{int(out[1])}:flags=lanczos"]
         cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "high",
-                "-crf", "18", "-preset", "veryfast", "-movflags", "+faststart"]
+                "-crf", "18", "-preset", "veryfast"]
+        if out and int(out[0]) * int(out[1]) >= BIG_OUT_AREA:
+            # ⚠️⚠️ Потолок битрейта только для выхода от 1080², и вот почему
+            # (замер 24.10 на настоящих кадрах петли, README): 1080×1920 при
+            # crf 18 — ~10 Мбит/с, 5 минут ≈ 377 МБ, а приём файла у приложения
+            # — 512 МБ. Плотная текстура (ролик «масло» в 1.8 раза тяжелее медианы)
+            # или шум пробивали бы этот потолок ПОСЛЕ 13 минут GPU. capped CRF:
+            # обычный клип потолка почти не касается (10.02 → 9.88 Мбит/с), худший
+            # прижат к ~10.3 Мбит/с → 5 минут ≤ ~390 МБ. 720×1280 и меньше —
+            # побайтно как раньше: там 5 минут ≈ 190 МБ.
+            cmd += ["-maxrate", BIG_OUT_MAXRATE, "-bufsize", BIG_OUT_BUFSIZE]
+        cmd += ["-movflags", "+faststart"]
         if mark:
             cmd += ["-metadata", "comment=AI-generated video (Timbrica clip generator)",
                     "-metadata", "synopsis=digitalsourcetype=trainedAlgorithmicMedia",
@@ -382,6 +436,27 @@ def handler(event):
     shot_len = max(int(round(shot_seconds * fps)), 2)
     steps = _steps_for(mo["strength"])
 
+    # Частота ВЫДАННОГО файла: fps (как было) или 2 × fps — середины шагов
+    # (_mid_frame). Генерация при этом та же: n_frames и цена прогона не
+    # меняются, меняется только плавность. Другие значения — не «округлим»,
+    # а отказ: молча выдать 12 к/с тому, кто просил 24, хуже ошибки.
+    try:
+        fps_out = int(inp.get("fps_out") or fps)
+    except (TypeError, ValueError):
+        return {"error": "bad_params"}
+    if fps_out not in (fps, 2 * fps):
+        return {"error": "bad_params"}
+    double = fps_out == 2 * fps
+
+    # Пульс под музыку. Без `react` поля energy/hits не читаются вовсе:
+    # старый вызов не может сломаться о поле, которого он не слал.
+    try:
+        react = motion.parse_react(inp.get("react"))
+        energy = motion.parse_energy(inp.get("energy"), total) if react > 0 else None
+        hits = motion.parse_hits(inp.get("hits"), total) if react > 0 else []
+    except ValueError:
+        return {"error": "bad_params"}
+
     plan = inp.get("shots")
     if plan is not None and not isinstance(plan, list):
         return {"error": "bad_shots"}
@@ -393,19 +468,31 @@ def handler(event):
         prompt,
     )
 
+    # Параметры перехода (i-1 → i) по кадрам. react = 0 — ровно константы
+    # стиля (те же объекты float), то есть побайтно прежний ролик.
+    curves = motion.motion_curves(total, fps, mo, react, energy, hits,
+                                  shot_starts, EFF_STEPS)
+
     t2i, i2i = _load()
-    t_first = t_loop = 0.0
+    t_first = t_loop = t_interp = 0.0
     ref = None
     per_frame = []
     shots = 0
+    frames_out = 0
 
     t0 = time.time()
-    enc = _Encoder(width, height, fps, mark, out_size)
+    enc = _Encoder(width, height, fps_out, mark, out_size)
     try:
         for i in range(total):
             # Начало шота: композиция ставится ЗАНОВО. Без этого зум за минуты
             # уводит камеру внутрь детали — см. README, пункт 1.
             if i in shot_starts:
+                if double and i > 0:
+                    # Середина на склейке — ПОВТОР последнего кадра шота, а не
+                    # смесь двух сцен: склейка обязана остаться жёсткой и
+                    # стоять на том же моменте, что при 12 к/с.
+                    enc.write(cur)
+                    frames_out += 1
                 shots += 1
                 g = torch.Generator("cuda").manual_seed(seed + shots * 7919)
                 ts = time.time()
@@ -426,19 +513,35 @@ def handler(event):
                 cur = np.array(img)
                 ref = _lab_stats(cur)          # цветовой якорь СВОЙ у каждого шота
                 enc.write(cur)
+                frames_out += 1
                 continue
 
             ts = time.time()
-            moved = _warp(cur, mo["zoom"], mo["angle"], mo["tx"], mo["ty"])
+            prev = cur
+            zoom, angle = curves["zoom"][i], curves["angle"][i]
+            tx, ty = curves["tx"][i], curves["ty"][i]
+            moved = _warp(prev, zoom, angle, tx, ty)
             out = i2i(prompt=frame_prompts[i], negative_prompt=NEG,
-                      image=Image.fromarray(moved), strength=mo["strength"],
-                      num_inference_steps=steps, guidance_scale=1.5,
+                      image=Image.fromarray(moved), strength=curves["strength"][i],
+                      num_inference_steps=curves["steps"][i], guidance_scale=1.5,
                       generator=g).images[0]
             cur = _color_match(np.array(out), ref)
+            if double:
+                tm = time.time()
+                enc.write(_mid_frame(prev, cur, zoom, angle, tx, ty))
+                frames_out += 1
+                t_interp += time.time() - tm
             enc.write(cur)
+            frames_out += 1
             dt = time.time() - ts
             t_loop += dt
             per_frame.append(dt)
+
+        if double:
+            # Последний кадр держится на свою вторую половину шага: 2·N кадров
+            # при 2·fps — ровно та же длительность, что N при fps.
+            enc.write(cur)
+            frames_out += 1
 
         ts = time.time()
         mp4 = enc.finish()
@@ -461,12 +564,19 @@ def handler(event):
         # Сид уезжает наружу ради «того же образа»: без него повторный прогон
         # рисует другой мир, и клип нельзя доработать, только переиграть.
         "seed": seed,
+        # n_frames — СГЕНЕРИРОВАННЫЕ кадры (на них считается цена и время);
+        # в файле их frames_out: при fps_out = 2·fps вдвое больше.
         "n_frames": total, "seconds": round(total / fps, 2), "shots": shots,
         "gen_seconds": round(gen, 1),
         "sec_per_frame": round(float(np.median(per_frame)), 3) if per_frame else None,
         "steps_per_frame": steps,
+        # Эхо принятого — им приложение отличает новый образ от старого:
+        # образ до 24.10 этих полей не вернёт, и «просили 24, а пришло 12»
+        # видно по ответу, а не по жалобе.
+        "fps_out": fps_out, "frames_out": frames_out,
+        "react": react, "hits_used": len(hits),
         "timings": {"first_frames": round(t_first, 1), "loop": round(t_loop, 1),
-                    "encode": round(t_encode, 1)},
+                    "encode": round(t_encode, 1), "interp": round(t_interp, 1)},
     }
 
     upload = inp.get("upload")

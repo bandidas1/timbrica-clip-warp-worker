@@ -49,6 +49,8 @@ RUN pip install -r requirements.txt
 COPY download_models.py .
 RUN python download_models.py
 
-COPY handler.py .
+# motion.py — математика движения (пульс, середина шага); handler без него
+# не импортируется, поэтому копируется тем же слоем.
+COPY handler.py motion.py ./
 
 CMD ["python", "-u", "handler.py"]

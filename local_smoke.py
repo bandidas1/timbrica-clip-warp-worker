@@ -8,6 +8,7 @@
     MODEL_DIR=Lykon/dreamshaper-8 LORA_DIR=latent-consistency/lcm-lora-sdv1-5 \
     python local_smoke.py
 """
+import argparse
 import base64
 import os
 import sys

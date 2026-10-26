@@ -422,6 +422,20 @@ def _schedule(total, fps, shot_len, plan, base_prompt):
     return starts, prompts
 
 
+def _render_range(shot_starts, total, render_shot):
+    """Какие кадры рисовать: [0, total) — весь клип, или кадры сцены
+    `render_shot` (с 1) — от её начала до начала следующей. (None, None) —
+    такой сцены в расписании нет."""
+    if not render_shot:
+        return 0, total
+    starts = sorted(shot_starts)
+    if not (1 <= render_shot <= len(starts)):
+        return None, None
+    lo = starts[render_shot - 1]
+    hi = starts[render_shot] if render_shot < len(starts) else total
+    return lo, hi
+
+
 def _deliver(mp4, upload):
     """Отдать готовый файл приложению; вернуть расписку.
 
@@ -565,6 +579,19 @@ def handler(event):
     except ValueError:
         return {"error": "bad_params"}
 
+    # Пересъёмка ОДНОЙ сцены (26.10.2026): приложение шлёт задание клипа
+    # целиком и номер сцены (с 1), которую нарисовать. Расписание и кривая
+    # пульса строятся по ВСЕМУ клипу — сцена выходит ровно той длины и с тем
+    # же движением, что в клипе, и приложение вклеивает её на место
+    # (App\Services\AiVideo\ClipSplice). shot_seed — свой сид этой сцены:
+    # иначе пересъёмка повторила бы её кадр в кадр.
+    try:
+        render_shot = int(inp.get("render_shot") or 0)
+        shot_seed = inp.get("shot_seed")
+        shot_seed = int(shot_seed) if shot_seed is not None else None
+    except (TypeError, ValueError):
+        return {"error": "bad_params"}
+
     plan = inp.get("shots")
     if plan is not None and not isinstance(plan, list):
         return {"error": "bad_shots"}
@@ -575,6 +602,10 @@ def handler(event):
         [s for s in (plan or []) if isinstance(s, dict)],
         prompt,
     )
+
+    lo, hi = _render_range(shot_starts, total, render_shot)
+    if lo is None:
+        return {"error": "bad_render_shot"}
 
     # Параметры перехода (i-1 → i) по кадрам. react = 0 — ровно константы
     # стиля (те же объекты float), то есть побайтно прежний ролик.
@@ -593,21 +624,29 @@ def handler(event):
     big = out_size is not None and out_size[0] * out_size[1] >= BIG_OUT_AREA
     enc_threads = ENC_THREADS if (double or big) else None
 
+    # Номер шота считается от начала клипа: у пересъёмки сцена k — k-я, как в
+    # клипе (без shot_seed сид тот же, что был у неё в клипе).
+    if render_shot:
+        shots = render_shot - 1
+
     t0 = time.time()
     enc = _Encoder(width, height, fps_out, mark, out_size, threads=enc_threads)
     try:
-        for i in range(total):
+        for i in range(lo, hi):
             # Начало шота: композиция ставится ЗАНОВО. Без этого зум за минуты
             # уводит камеру внутрь детали — см. README, пункт 1.
             if i in shot_starts:
-                if double and i > 0:
+                # У пересъёмки повтор перед её первым кадром — кадр ЧУЖОЙ
+                # (предыдущей сцены): он остаётся в клипе, не в сцене.
+                if double and i > lo:
                     # Середина на склейке — ПОВТОР последнего кадра шота, а не
                     # смесь двух сцен: склейка обязана остаться жёсткой и
                     # стоять на том же моменте, что при 12 к/с.
                     enc.write(cur)
                     frames_out += 1
                 shots += 1
-                g = torch.Generator("cuda").manual_seed(seed + shots * 7919)
+                g = torch.Generator("cuda").manual_seed(
+                    shot_seed if (render_shot and shot_seed is not None) else seed + shots * 7919)
                 ts = time.time()
                 if init_img is not None:
                     # Сцена стартует с обложки, перерисованной под её промпт.
@@ -652,7 +691,9 @@ def handler(event):
 
         if double:
             # Последний кадр держится на свою вторую половину шага: 2·N кадров
-            # при 2·fps — ровно та же длительность, что N при fps.
+            # при 2·fps — ровно та же длительность, что N при fps. У пересъёмки
+            # это тот же кадр, что в клипе стоит перед следующей сценой (или в
+            # конце): её выход — ровно кадры [2·lo, 2·hi) клипа.
             enc.write(cur)
             frames_out += 1
 
@@ -679,7 +720,7 @@ def handler(event):
         "seed": seed,
         # n_frames — СГЕНЕРИРОВАННЫЕ кадры (на них считается цена и время);
         # в файле их frames_out: при fps_out = 2·fps вдвое больше.
-        "n_frames": total, "seconds": round(total / fps, 2), "shots": shots,
+        "n_frames": hi - lo, "seconds": round((hi - lo) / fps, 2), "shots": shots,
         "gen_seconds": round(gen, 1),
         "sec_per_frame": round(float(np.median(per_frame)), 3) if per_frame else None,
         "steps_per_frame": steps,
@@ -688,6 +729,9 @@ def handler(event):
         # видно по ответу, а не по жалобе.
         "fps_out": fps_out, "frames_out": frames_out,
         "react": react, "hits_used": len(hits),
+        # Эхо пересъёмки: приложение сверяет его с заказанной сценой — образ
+        # без render_shot молча нарисовал бы весь клип по цене одной сцены.
+        "render_shot": render_shot, "frames": [lo, hi],
         # write — сколько петля простояла на полной очереди к кодировщику:
         # ненулевое значение = кодировщик не успевает и тормозит GPU.
         "timings": {"first_frames": round(t_first, 1), "loop": round(t_loop, 1),

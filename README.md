@@ -50,7 +50,8 @@ Blackwell Server Edition MIG 1g.24gb"]`, дата-центры — как у в�
 - `excludedTypes` в PATCH `/v2/serverless/{id}` требует `pools` в том же теле;
   RunPod сам проставляет `minCudaVersion 12.0`. Любой PATCH = rolling-перезапуск
   воркеров (здесь их один, и он вышел из THROTTLED в IDLE за минуту).
-- **⚠️⚠️ С 24.10 образ закреплён тегом коммита, а не `:latest`** (сейчас
+- **⚠️⚠️ С 24.10 образ закреплён тегом коммита, а не `:latest`** (с 26.10 —
+  `…:074a6eb3060da307865a02e0fc207b980d774005`, `render_shot`; откат —
   `…:b9768c55a6d4ce2cf90a8b31f65802d209558009`, digest `sha256:eb15eab4…f312`).
   Замер того дня: после пересборки `:latest` простаивающий воркер остался на
   ПРЕЖНЕМ образе, а PATCH с той же строкой `image` — пустой: `endpointVersion`
@@ -64,6 +65,8 @@ Blackwell Server Edition MIG 1g.24gb"]`, дата-центры — как у в�
 - 24.10 `workers.max` поднят 0 → 1 (RunPod опустил его за 14 дней простоя, см.
   docs/why/runpod.md): `PATCH /v2/serverless/{id}` `{"workers": {"max": 1,
   "min": 0, "idleTimeout": 10}}`.
+- 27.10 `workers.max` 1 → 2 — второй воркер забран у апскейла видео (2 → 1), квота аккаунта
+  10 из 10; `CLIP_WORKERS=2`, очередь считает `App\Services\AiVideo\ClipQueue`.
 
 ## 💰 Себестоимость — ЗАМЕРЕНА на живой RTX 4090 (03.09.2026)
 

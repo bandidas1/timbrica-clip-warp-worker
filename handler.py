@@ -422,6 +422,13 @@ def _schedule(total, fps, shot_len, plan, base_prompt):
     return starts, prompts
 
 
+def _gpu_name():
+    try:
+        return torch.cuda.get_device_name(0)
+    except Exception:  # noqa: BLE001 — метрика не роняет прогон
+        return None
+
+
 def _render_range(shot_starts, total, render_shot):
     """Какие кадры рисовать: [0, total) — весь клип, или кадры сцены
     `render_shot` (с 1) — от её начала до начала следующей. (None, None) —
@@ -738,6 +745,10 @@ def handler(event):
                     "encode": round(t_encode, 1), "interp": round(t_interp, 1),
                     "write": round(enc.t_blocked, 1)},
         "cpu": dict(CPU_INFO, enc_threads=enc_threads),
+        # Какая карта рисовала. 24–25.10 клипы шли 0.27–0.29 с/кадр, с 26.10 —
+        # 0.21 при том же коде; без имени карты это нельзя ни доказать, ни
+        # учесть в цене (пулы ADA_24 и AMPERE_24 разнятся вдвое по цене часа).
+        "gpu": _gpu_name(),
     }
 
     upload = inp.get("upload")

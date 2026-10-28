@@ -278,7 +278,8 @@ class _Encoder:
             # ⚠️⚠️ Потолок битрейта только для выхода от 1080², и вот почему
             # (замер 24.10 на настоящих кадрах петли, README): 1080×1920 при
             # crf 18 — ~10 Мбит/с, 5 минут ≈ 377 МБ, а приём файла у приложения
-            # — 512 МБ. Плотная текстура (ролик «масло» в 1.8 раза тяжелее медианы)
+            # — 480 МБ (CLIP_UPLOAD_MAX_MB; ⚠️ до 29.10 там стояли 200, и этот
+            # комментарий утверждал 512 — README «Доставка файла»). Плотная текстура (ролик «масло» в 1.8 раза тяжелее медианы)
             # или шум пробивали бы этот потолок ПОСЛЕ 13 минут GPU. capped CRF:
             # обычный клип потолка почти не касается (10.02 → 9.88 Мбит/с), худший
             # прижат к ~10.3 Мбит/с → 5 минут ≤ ~390 МБ. 720×1280 и меньше —
@@ -492,7 +493,7 @@ def _render_range(shot_starts, total, render_shot):
     return lo, hi
 
 
-def _deliver(mp4, upload):
+def _deliver(mp4, upload, post=None, sleep=None, clock=None):
     """Отдать готовый файл приложению; вернуть расписку.
 
     ⚠️⚠️ ПОЧЕМУ НЕ ИНЛАЙН: замер 03.09 — 30 секунд видео это 7.9 МБ, значит
@@ -500,14 +501,33 @@ def _deliver(mp4, upload):
     результата RunPod, то есть длинный клип инлайном просто не доедет.
     Короткий (превью) по-прежнему едет инлайном — ему дверь не нужна.
 
+    ⚠️⚠️ ПОЧЕМУ ПОРЦИЯМИ И С ПОВТОРОМ (29.10.2026). До этого файл уходил одним
+    POST и один обрыв выбрасывал всю отрисовку. 28.10 18:20–19:25 сеть до
+    Бегета зависала (nginx отвечал 408 после 60 с тишины каждой пятидесятой
+    порции чужих загрузок), и три клипа 1080p по 226 с (~220 МБ) упали
+    `upload_failed: ConnectionError` — каждый после десяти минут GPU. Теперь,
+    если приложение назвало `chunk_bytes`, файл идёт порциями протоколом
+    смещений (ClipUploadController::storeSlice): ответ сервера `received` —
+    единственная правда о том, с какого байта продолжать, а отказ стоит одной
+    порции. Сдаёмся, только когда продвижения нет `stall_s` секунд или вся
+    загрузка идёт дольше `total_s` — у задания RunPod свой потолок (30 мин),
+    и пятиминутный 1080p сам занимает его большую часть.
+
     Расписка несёт размер и sha256, и приложение сверяет её с тем, что реально
     легло на диск: «доехало битым» обязано быть отличимо от «доехало».
     """
-    import requests
+    # Импорты здесь, а не только наверху: upload_selftest.py берёт эти функции
+    # из исходника без torch и без модульных имён.
+    import hashlib
+    import os
+    import time
 
     url = (upload.get("url") or "").strip()
     if not url:
         return {"error": "upload_no_url"}
+    if post is None:
+        import requests
+        post = requests.post
 
     digest = hashlib.sha256(mp4).hexdigest()
     headers = {
@@ -515,21 +535,92 @@ def _deliver(mp4, upload):
         "X-Clip-Expires": str(upload.get("expires") or ""),
         "X-Clip-Sig": str(upload.get("sig") or ""),
     }
+    way = dict(post=post, sleep=sleep or time.sleep, clock=clock or time.monotonic,
+               stall_s=float(os.environ.get("UPLOAD_STALL_S", 360)),
+               total_s=float(os.environ.get("UPLOAD_TOTAL_S", 900)))
+    chunk = int(upload.get("chunk_bytes") or 0)
+    if chunk > 0:
+        return _deliver_slices(url, headers, mp4, digest, chunk, **way)
+    return _deliver_whole(url, headers, mp4, digest, **way)
+
+
+def _upload_retryable(status):
+    """Отказ, который стоит повторить: обрыв (0), 408 тишины, перегрузка, 5xx.
+    403 подписи, 404/409 улаженной генерации, 413 размера, 422 не того файла —
+    повтор их не изменит."""
+    return status == 0 or status in (408, 425, 429, 500, 502, 503, 504)
+
+
+def _upload_pause(attempt):
+    """Пауза перед повтором: быстро на одиночной заминке, не чаще раза в 30 с
+    в долгом провале сети."""
+    return (2, 5, 10, 20)[attempt] if attempt < 4 else 30
+
+
+def _upload_send(post, url, headers, timeout, **kw):
+    """Один запрос: (код, json, текст ошибки для лога). Обрыв — код 0."""
     try:
-        resp = requests.post(
-            url, headers=headers,
-            files={"file": ("clip.mp4", mp4, "video/mp4")},
-            timeout=(15, 300),
-        )
+        resp = post(url, headers=headers, timeout=timeout, **kw)
     except Exception as exc:
-        return {"error": f"upload_failed: {type(exc).__name__}"[:200]}
+        return 0, {}, f"upload_failed: {type(exc).__name__}"[:200]
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    return resp.status_code, body, f"upload_http_{resp.status_code}: {(resp.text or '')[:150]}"
 
-    if resp.status_code != 200:
-        # Текст ответа приложения полезен в логе прогона: 403 подписи и 413
-        # размера — разные аварии, и различать их надо на этой стороне тоже.
-        return {"error": f"upload_http_{resp.status_code}: {resp.text[:150]}"}
 
-    return {"stored": True, "bytes": len(mp4), "sha256": digest}
+def _deliver_slices(url, headers, mp4, digest, chunk, post, sleep, clock, stall_s, total_s):
+    size = len(mp4)
+    offset = 0
+    started = progressed = clock()
+    attempt = retries = 0
+    while True:
+        status, body, err = _upload_send(
+            post, url, headers, (15, 120),
+            data={"offset": str(offset), "size": str(size), "sha256": digest},
+            files={"chunk": ("clip.part", mp4[offset:offset + chunk], "application/octet-stream")},
+        )
+        if status == 200 and body.get("done"):
+            return {"stored": True, "bytes": size, "sha256": digest, "upload_retries": retries}
+        # Сервер называет, сколько у него есть: и после принятой порции (200),
+        # и после порции не с того места (409 gap) — продолжать с этого байта.
+        if (status == 200 or (status == 409 and body.get("error") == "gap")) and "received" in body:
+            received = int(body["received"])
+            moved = received > offset
+            offset = max(0, min(received, size))
+            if moved:
+                progressed = clock()
+                attempt = 0
+                continue
+        elif not _upload_retryable(status):
+            return {"error": err}
+        now = clock()
+        if now - progressed >= stall_s or now - started >= total_s:
+            return {"error": err}
+        sleep(_upload_pause(attempt))
+        attempt += 1
+        retries += 1
+
+
+def _deliver_whole(url, headers, mp4, digest, post, sleep, clock, stall_s, total_s):
+    """Приложение до 29.10 порций не знает — файл целиком, с тем же повтором."""
+    started = clock()
+    attempt = 0
+    while True:
+        status, body, err = _upload_send(
+            post, url, headers, (15, 300),
+            files={"file": ("clip.mp4", mp4, "video/mp4")},
+        )
+        if status == 200:
+            return {"stored": True, "bytes": len(mp4), "sha256": digest, "upload_retries": attempt}
+        # Текст ответа полезен в логе прогона: 403 подписи и 413 размера —
+        # разные аварии, и различать их надо на этой стороне тоже.
+        if not _upload_retryable(status) or attempt >= 2 or clock() - started >= total_s:
+            return {"error": err}
+        sleep(_upload_pause(attempt))
+        attempt += 1
 
 
 # -------------------------------------------------------------------- handler

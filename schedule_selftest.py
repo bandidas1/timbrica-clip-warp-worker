@@ -24,11 +24,12 @@ def _load(names):
     tree = ast.parse(src)
     keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     ns = {}
+    # Функции видят друг друга через общий словарь (_schedule зовёт _plan_walk).
     exec(compile(ast.Module(body=keep, type_ignores=[]), "handler.py", "exec"), ns)
     return [ns[n] for n in names]
 
 
-_schedule, _render_range = _load(["_schedule", "_render_range"])
+_schedule, _render_range, _plan_walk, _shot_seeds = _load(["_schedule", "_render_range", "_plan_walk", "_shot_seeds"])
 
 # Случаи — то, что приходит на самом деле, и края: план короче и длиннее клипа,
 # пустые и битые длины, половина кадра (банковское округление Python), не-словарь.
@@ -76,6 +77,14 @@ def main():
         assert _render_range(set(r[0] for r in rs), total, 0) == (0, total)
         assert _render_range(set(r[0] for r in rs), total, len(rs) + 1) == (None, None)
         rows.append({"params": c, "frames": rs})
+        # Свой сид шота (раскадровка) ложится РОВНО на кадр начала того же шота,
+        # что и в расписании: иначе клип начал бы сцену не с показанного кадра.
+        if c["shots"]:
+            fps, shot_len = c["fps"], max(int(round(c["shot_seconds"] * c["fps"])), 2)
+            plan = [dict(s, seed=1000 + k) if isinstance(s, dict) else s for k, s in enumerate(c["shots"])]
+            seeds = _shot_seeds(total, fps, shot_len, [s for s in plan if isinstance(s, dict)])
+            walked = [start for start, _l, _s in _plan_walk(total, fps, shot_len, [s for s in plan if isinstance(s, dict)])]
+            assert sorted(seeds) == walked and set(walked) <= set(r[0] for r in rs), (c, seeds, rs)
     if "--emit" in sys.argv:
         path = sys.argv[sys.argv.index("--emit") + 1]
         with open(path, "w", encoding="utf-8", newline="\n") as f:

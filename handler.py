@@ -400,19 +400,12 @@ def _schedule(total, fps, shot_len, plan, base_prompt):
         return starts, prompts
 
     at = 0
-    for shot in plan:
-        if at >= total:
-            break
+    for start, length, shot in _plan_walk(total, fps, shot_len, plan):
         text = (shot.get("prompt") or base_prompt).strip() or base_prompt
-        try:
-            secs = float(shot.get("seconds") or 0)
-        except (TypeError, ValueError):
-            secs = 0.0
-        length = max(int(round(secs * fps)), 2) if secs > 0 else shot_len
-        starts.add(at)
-        for i in range(at, min(at + length, total)):
+        starts.add(start)
+        for i in range(start, min(start + length, total)):
             prompts[i] = text
-        at += length
+        at = start + length
 
     if at < total:                      # план короче клипа — добиваем последним
         for i in range(at, total):
@@ -420,6 +413,62 @@ def _schedule(total, fps, shot_len, plan, base_prompt):
 
     starts.add(0)
     return starts, prompts
+
+
+def _plan_walk(total, fps, shot_len, plan):
+    """(начало, длина, шот) каждого шота плана, что помещается в клип, — ОДИН
+    обход на расписание (_schedule) и на сиды сцен (_shot_seeds): разойдись они
+    хоть на кадр — раскадровка показала бы не те кадры, с которых начнётся клип."""
+    at = 0
+    for shot in plan:
+        if at >= total:
+            break
+        try:
+            secs = float(shot.get("seconds") or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        length = max(int(round(secs * fps)), 2) if secs > 0 else shot_len
+        yield at, length, shot
+        at += length
+
+
+def _shot_seeds(total, fps, shot_len, plan):
+    """Кадр начала шота -> свой сид шота из плана (раскадровка 29.10.2026).
+
+    Человек перерисовал кадр одной сцены в раскадровке — у неё свой сид, и клип
+    обязан начать эту сцену с того же кадра. Шот без своего сида — прежний
+    `seed + номер * 7919`, побайтно как раньше."""
+    out = {}
+    for start, _length, shot in _plan_walk(total, fps, shot_len, plan or []):
+        s = shot.get("seed")
+        if isinstance(s, int) and not isinstance(s, bool) and 0 <= s <= 0x7FFFFFFF:
+            out[start] = s
+    return out
+
+
+def _thumb_b64(img, long_side=384, quality=82):
+    """Кадр раскадровки -> JPEG base64. Уменьшенный: 43 сцены в одном ответе
+    RunPod (~0.5 МБ), а не 43 полноразмерных кадра."""
+    w, h = img.size
+    k = min(1.0, long_side / max(w, h))
+    if k < 1.0:
+        img = img.resize((max(16, round(w * k)), max(16, round(h * k))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _shot_first_frame(t2i, i2i, text, init_img, init_strength, width, height, g):
+    """Первый кадр сцены — ОДИН код на клип и на раскадровку."""
+    if init_img is not None:
+        # Сцена стартует с обложки, перерисованной под её промпт. Шаги —
+        # эффективные (см. _steps_for): при силе 0.58 и четырёх номинальных
+        # шагах модель получила бы два.
+        return i2i(prompt=text, negative_prompt=NEG, image=init_img, strength=init_strength,
+                   num_inference_steps=_steps_for(init_strength),
+                   guidance_scale=1.5, generator=g).images[0]
+    return t2i(prompt=text, negative_prompt=NEG, num_inference_steps=4,
+               guidance_scale=1.5, width=width, height=height, generator=g).images[0]
 
 
 def _gpu_name():
@@ -610,6 +659,42 @@ def handler(event):
         prompt,
     )
 
+    plan_seeds = _shot_seeds(total, fps, shot_len, [s for s in (plan or []) if isinstance(s, dict)])
+
+    # Раскадровка (29.10.2026): только ПЕРВЫЙ кадр каждой сцены — тот же, с
+    # которого начнётся клип с этим сидом (тот же промпт, сид, размер, обложка),
+    # без петли warp и без файла. `only` — номера сцен (с 1), если перерисовать
+    # надо не все. Человек видит, что получит, ДО оплаты клипа.
+    if inp.get("storyboard"):
+        only = inp.get("only")
+        if only is not None:
+            if not isinstance(only, list) or len(only) > 200 or not all(
+                    isinstance(k, int) and not isinstance(k, bool) and k >= 1 for k in only):
+                return {"error": "bad_params"}
+            only = set(only)
+        t2i, i2i = _load()
+        t0 = time.time()
+        stills = []
+        try:
+            for j, start in enumerate(sorted(shot_starts), start=1):
+                if only is not None and j not in only:
+                    continue
+                s_j = plan_seeds.get(start, seed + j * 7919)
+                g = torch.Generator("cuda").manual_seed(s_j)
+                img = _shot_first_frame(t2i, i2i, frame_prompts[start], init_img, init_strength,
+                                        width, height, g)
+                stills.append({"shot": j, "frame": start, "seed": s_j, "jpg": _thumb_b64(img)})
+        except torch.cuda.OutOfMemoryError:
+            return {"error": "out_of_memory"}
+        except Exception as exc:                  # приложение вернёт токены целиком
+            return {"error": f"{type(exc).__name__}: {exc}"[:300]}
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+        return {"storyboard": stills, "shots": len(shot_starts), "seed": seed,
+                "width": width, "height": height, "gpu": _gpu_name(),
+                "timings": {"first_frames": round(time.time() - t0, 2)}}
+
     lo, hi = _render_range(shot_starts, total, render_shot)
     if lo is None:
         return {"error": "bad_render_shot"}
@@ -652,22 +737,14 @@ def handler(event):
                     enc.write(cur)
                     frames_out += 1
                 shots += 1
+                # Сид сцены: пересъёмка — свой; сцена, перерисованная в
+                # раскадровке, — свой из плана; иначе прежний seed + номер.
                 g = torch.Generator("cuda").manual_seed(
-                    shot_seed if (render_shot and shot_seed is not None) else seed + shots * 7919)
+                    shot_seed if (render_shot and shot_seed is not None)
+                    else plan_seeds.get(i, seed + shots * 7919))
                 ts = time.time()
-                if init_img is not None:
-                    # Сцена стартует с обложки, перерисованной под её промпт.
-                    # Шаги — эффективные (см. _steps_for): при силе 0.58 и
-                    # четырёх номинальных шагах модель получила бы два.
-                    img = i2i(prompt=frame_prompts[i], negative_prompt=NEG,
-                              image=init_img, strength=init_strength,
-                              num_inference_steps=_steps_for(init_strength),
-                              guidance_scale=1.5, generator=g).images[0]
-                else:
-                    img = t2i(prompt=frame_prompts[i], negative_prompt=NEG,
-                              num_inference_steps=4,
-                              guidance_scale=1.5, width=width, height=height,
-                              generator=g).images[0]
+                img = _shot_first_frame(t2i, i2i, frame_prompts[i], init_img, init_strength,
+                                        width, height, g)
                 t_first += time.time() - ts
                 cur = np.array(img)
                 ref = _lab_stats(cur)          # цветовой якорь СВОЙ у каждого шота

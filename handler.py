@@ -71,6 +71,9 @@ ALLOWED_SIZES = {
 # раздувает байты на треть, и упереться в предел ПОСЛЕ прогона — значит выбросить
 # уже потраченные GPU-минуты.
 INLINE_MAX_BYTES = int(os.environ.get("INLINE_MAX_BYTES", 6 * 1024 * 1024))
+# Подсмотр «сейчас рисуется» (29.10.2026): не чаще раза в столько секунд — кадр
+# уходит приложению через статус задания, приложение спрашивает раз в 8 с.
+PEEK_EVERY_S = float(os.environ.get("PEEK_EVERY_S", 4))
 EFF_STEPS = float(os.environ.get("EFF_STEPS", 3.5))
 
 # Выход от этой площади (1080×1080 и больше) кодируется с потолком битрейта —
@@ -445,6 +448,22 @@ def _shot_seeds(total, fps, shot_len, plan):
         if isinstance(s, int) and not isinstance(s, bool) and 0 <= s <= 0x7FFFFFFF:
             out[start] = s
     return out
+
+
+def _peek(job, frame, where, img_arr):
+    """Кадр «сейчас рисуется» — приложению через статус задания (`progress_update`
+    SDK: `/status` отдаёт его как `output`, пока задание IN_PROGRESS). Уменьшенный
+    JPEG и где отрисовка; SDK шлёт его своим потоком — петлю GPU это не держит.
+    Сбой — молча мимо: это подсмотр, а не результат."""
+    try:
+        update = getattr(getattr(runpod, "serverless", None), "progress_update", None)
+        if update is None:
+            return False
+        update(job, {"peek": dict(where, frame=int(frame),
+                                  jpg=_thumb_b64(Image.fromarray(img_arr), long_side=320, quality=72))})
+        return True
+    except Exception:  # noqa: BLE001 — подсмотр не роняет прогон
+        return False
 
 
 def _thumb_b64(img, long_side=384, quality=82):
@@ -840,6 +859,11 @@ def handler(event):
     big = out_size is not None and out_size[0] * out_size[1] >= BIG_OUT_AREA
     enc_threads = ENC_THREADS if (double or big) else None
 
+    # Подсмотр: только когда приложение попросило (`peek`) и задание настоящее.
+    peek_job = event if (inp.get("peek") and isinstance(event, dict) and event.get("id")) else None
+    peek_at = 0.0
+    peek_where = {"total": total, "scenes": len(shot_starts)}
+
     t0 = time.time()
     enc = _Encoder(width, height, fps_out, mark, out_size, threads=enc_threads)
     try:
@@ -874,6 +898,9 @@ def handler(event):
                     ref = _lab_stats(cur)          # цветовой якорь СВОЙ у каждого шота
                     enc.write(cur)
                     frames_out += 1
+                    if peek_job is not None and time.time() - peek_at >= PEEK_EVERY_S:
+                        peek_at = time.time()
+                        _peek(peek_job, i, dict(peek_where, scene=shots), cur)
                     continue
 
                 ts = time.time()
@@ -893,6 +920,9 @@ def handler(event):
                     t_interp += time.time() - tm
                 enc.write(cur)
                 frames_out += 1
+                if peek_job is not None and time.time() - peek_at >= PEEK_EVERY_S:
+                    peek_at = time.time()
+                    _peek(peek_job, i, dict(peek_where, scene=shots), cur)
                 dt = time.time() - ts
                 t_loop += dt
                 per_frame.append(dt)
@@ -945,6 +975,8 @@ def handler(event):
         # Несколько сцен одним заданием: их номера и кадры по порядку клипа —
         # файл несёт кадры этих диапазонов подряд (ClipSplice::runRanges).
         "render_shots": [r[2] for r in ranges] if render_shots else None,
+        # Эхо подсмотра: приложение отличает образ, который его шлёт.
+        "peek": peek_job is not None,
         "frame_ranges": [[r[0], r[1]] for r in ranges],
         # write — сколько петля простояла на полной очереди к кодировщику:
         # ненулевое значение = кодировщик не успевает и тормозит GPU.

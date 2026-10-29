@@ -8,6 +8,7 @@ on:
       - "motion.py"
       - "motion_selftest.py"
       - "upload_selftest.py"
+      - "schedule_selftest.py"
       - "download_models.py"
       - "Dockerfile"
       - "requirements.txt"
@@ -38,6 +39,12 @@ jobs:
       # first dropped connection again — stop the image before it ships.
       - name: Upload self-test
         run: python3 upload_selftest.py
+
+      # Scene schedule and redo ranges (2026-10-29): the app splices redone
+      # scenes back by these frame numbers — one frame off is a flashing frame
+      # of the neighbouring scene in someone's clip.
+      - name: Schedule self-test
+        run: python3 schedule_selftest.py
 
       # torch-cu124 + baked SD weights ≈ 8 GB — free the runner disk first.
       - name: Free disk space

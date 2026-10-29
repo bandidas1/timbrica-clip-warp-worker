@@ -29,7 +29,8 @@ def _load(names):
     return [ns[n] for n in names]
 
 
-_schedule, _render_range, _plan_walk, _shot_seeds = _load(["_schedule", "_render_range", "_plan_walk", "_shot_seeds"])
+_schedule, _render_range, _plan_walk, _shot_seeds, _render_ranges = _load(
+    ["_schedule", "_render_range", "_plan_walk", "_shot_seeds", "_render_ranges"])
 
 # Случаи — то, что приходит на самом деле, и края: план короче и длиннее клипа,
 # пустые и битые длины, половина кадра (банковское округление Python), не-словарь.
@@ -76,6 +77,20 @@ def main():
             assert b0 == a1 and a0 < b0, (c, rs)
         assert _render_range(set(r[0] for r in rs), total, 0) == (0, total)
         assert _render_range(set(r[0] for r in rs), total, len(rs) + 1) == (None, None)
+        starts = set(r[0] for r in rs)
+        # Весь клип и одна сцена — как до пачки (старые задания ведут себя так же).
+        assert _render_ranges(starts, total, 0, None) == [(0, total, 0, None)]
+        assert _render_ranges(starts, total, 1, 77) == [(rs[0][0], rs[0][1], 1, 77)]
+        assert _render_ranges(starts, total, len(rs) + 1, None) is None
+        # Несколько сцен: по порядку клипа, без повторов, сид — свой у каждой,
+        # `render_shots` перекрывает `render_shot`; чужой номер — отказ всей пачке.
+        if len(rs) >= 3:
+            got = _render_ranges(starts, total, 1, 5, [3, 1, 3], {"1": 11, "3": 33})
+            assert got == [(rs[0][0], rs[0][1], 1, 11), (rs[2][0], rs[2][1], 3, 33)], (c, got)
+            got = _render_ranges(starts, total, 3, None, [len(rs), 2], {})
+            assert got == [(rs[1][0], rs[1][1], 2, None), (rs[-1][0], rs[-1][1], len(rs), None)], (c, got)
+            assert _render_ranges(starts, total, 1, None, [2, len(rs) + 1], {}) is None
+            assert _render_ranges(starts, total, 1, None, [True], {}) is None
         rows.append({"params": c, "frames": rs})
         # Свой сид шота (раскадровка) ложится РОВНО на кадр начала того же шота,
         # что и в расписании: иначе клип начал бы сцену не с показанного кадра.

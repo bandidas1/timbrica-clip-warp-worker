@@ -491,6 +491,20 @@ def _shot_first_frame(t2i, i2i, text, init_img, init_strength, width, height, g)
                guidance_scale=1.5, width=width, height=height, generator=g).images[0]
 
 
+def _affine(w, h, zoom, angle, tx, ty):
+    """Матрица шага камеры 3×3 — та же, что строит _warp."""
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, zoom)
+    m[0, 2] += tx
+    m[1, 2] += ty
+    return np.vstack([m, [0.0, 0.0, 1.0]])
+
+
+def _key_image(raw, width, height):
+    """Ключевой кадр сцены от приложения — кадр клипа размером width×height
+    (кроп «cover»: модель рисует ту же пропорцию, кроп снимает лишь округление)."""
+    return _cover(Image.open(io.BytesIO(raw)).convert("RGB"), width, height)
+
+
 def _gpu_name():
     try:
         return torch.cuda.get_device_name(0)
@@ -744,6 +758,34 @@ def handler(event):
             return {"error": "bad_params"}
         mo["strength"] = s
 
+    # Ключевые кадры сцен (04.11.2026, чат 729): первый кадр сцены рисует
+    # сильная модель на стороне приложения (FLUX через DeepInfra), петля warp
+    # продолжает его. SD1.5 + LCM на 4 шагах терял детали описания (47 из 57
+    # в кадре) и рисовал азиатские лица на ~16 из 18 нейтральных описаний.
+    # Ключ — номер СТАРТОВОГО кадра сцены: так же адресованы сиды (_shot_seeds),
+    # и пересъёмка берёт кадры своих сцен тем же словарём.
+    keyframes = {}
+    kf = inp.get("keyframes")
+    if kf is not None:
+        if not isinstance(kf, dict) or len(kf) > 200:
+            return {"error": "bad_keyframes"}
+        for k, v in kf.items():
+            try:
+                fi = int(k)
+                raw = base64.b64decode(v, validate=True)
+            except Exception:
+                return {"error": "bad_keyframes"}
+            if fi < 0 or len(raw) > 2 * 1024 * 1024:
+                return {"error": "bad_keyframes"}
+            keyframes[fi] = raw
+
+    try:
+        key_anchor = float(inp.get("key_anchor", 0) or 0)
+    except (TypeError, ValueError):
+        return {"error": "bad_params"}
+    if not (0.0 <= key_anchor <= 0.8):
+        return {"error": "bad_params"}
+
     mark = bool(inp.get("mark", True))
     seed = inp.get("seed")
     seed = int(seed) if seed is not None else int(time.time()) & 0x7FFFFFFF
@@ -849,6 +891,7 @@ def handler(event):
 
     t2i, i2i = _load()
     t_first = t_loop = t_interp = 0.0
+    anchor = None                                  # (ключевой кадр, суммарная матрица камеры) сцены
     ref = None
     per_frame = []
     shots = 0
@@ -891,11 +934,17 @@ def handler(event):
                         r_seed if (r_shot and r_seed is not None)
                         else plan_seeds.get(i, seed + shots * 7919))
                     ts = time.time()
-                    img = _shot_first_frame(t2i, i2i, frame_prompts[i], init_img, init_strength,
-                                            width, height, g)
+                    if i in keyframes:
+                        img = _key_image(keyframes[i], width, height)
+                    else:
+                        img = _shot_first_frame(t2i, i2i, frame_prompts[i], init_img, init_strength,
+                                                width, height, g)
                     t_first += time.time() - ts
                     cur = np.array(img)
                     ref = _lab_stats(cur)          # цветовой якорь СВОЙ у каждого шота
+                    # Якорь сцены — её ключевой кадр, сдвинутый тем же суммарным
+                    # движением камеры (key_anchor > 0 и только у сцен с ключевым кадром).
+                    anchor = (cur.copy(), np.eye(3)) if (key_anchor > 0 and i in keyframes) else None
                     enc.write(cur)
                     frames_out += 1
                     if peek_job is not None and time.time() - peek_at >= PEEK_EVERY_S:
@@ -908,6 +957,15 @@ def handler(event):
                 zoom, angle = curves["zoom"][i], curves["angle"][i]
                 tx, ty = curves["tx"][i], curves["ty"][i]
                 moved = _warp(prev, zoom, angle, tx, ty)
+                if anchor is not None:
+                    # Петля SD1.5 перерисовывает кадр с силой ~0.5 каждые 1/12 с и за
+                    # ~1 с уводит ключевой кадр к своему: лица FLUX становились её
+                    # лицами (замер 04.11). Вход i2i — смесь с ключевым кадром.
+                    anchor = (anchor[0], _affine(anchor[0].shape[1], anchor[0].shape[0], zoom, angle, tx, ty) @ anchor[1])
+                    k = cv2.warpAffine(anchor[0], anchor[1][:2], (moved.shape[1], moved.shape[0]),
+                                       flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT_101)
+                    moved = ((1 - key_anchor) * moved.astype(np.float32)
+                             + key_anchor * k.astype(np.float32)).clip(0, 255).astype(np.uint8)
                 out = i2i(prompt=frame_prompts[i], negative_prompt=NEG,
                           image=Image.fromarray(moved), strength=curves["strength"][i],
                           num_inference_steps=curves["steps"][i], guidance_scale=1.5,

@@ -1,0 +1,60 @@
+name: patch-layer
+
+# Ship a source fix ONTO the image production already runs, not a rebuild.
+#
+# WHY (measured 2026-11-04 on the sibling workers): a rebuild from the very
+# production commit resolves a different runtime — the Dockerfile pins few
+# packages. This appends ONE layer with /app/handler.py and /app/motion.py to
+# the exact production image (`crane append`: registry-side, the base layers are
+# never downloaded) and checks the files in the image are the files in this
+# commit. The base may be given as a tag: it is resolved to a digest first and
+# printed. Pin the printed digest in the RunPod template; never a tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "The image production runs: ghcr.io/…/timbrica-clip-warp-worker:<tag> or @sha256:…"
+        required: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same gates as build.yml: the loop maths, delivery and scene schedule are
+      # checked without a GPU before anything ships.
+      - name: Motion self-test
+        run: python3 motion_selftest.py
+      - name: Upload self-test
+        run: python3 upload_selftest.py
+      - name: Schedule self-test
+        run: python3 schedule_selftest.py
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Append handler.py + motion.py onto the production image
+        run: |
+          set -eu
+          crane auth login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          REPO="ghcr.io/${{ github.repository_owner }}/timbrica-clip-warp-worker"
+          BASE="${{ inputs.base }}"
+          case "$BASE" in
+            "$REPO"@sha256:*) DIG="$BASE" ;;
+            "$REPO":*) DIG="$REPO@$(crane digest "$BASE")" ;;
+            *) echo "base must be $REPO:<tag> or $REPO@sha256:…"; exit 1 ;;
+          esac
+          echo "base digest: $DIG"
+          mkdir -p layer/app && cp handler.py motion.py layer/app/
+          tar -C layer --owner=0 --group=0 -cf layer.tar app/handler.py app/motion.py
+          NEW="$REPO:patch-${{ github.sha }}"
+          crane append -b "$DIG" -f layer.tar -t "$NEW"
+          echo "pin this in RunPod: $REPO@$(crane digest "$NEW")"
+          crane export "$NEW" - | tar -xO app/handler.py | sha256sum
+          sha256sum handler.py
+          crane export "$NEW" - | tar -xO app/motion.py | sha256sum
+          sha256sum motion.py

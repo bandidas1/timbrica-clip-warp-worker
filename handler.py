@@ -10,6 +10,7 @@
 её проверяет motion_selftest.py там, где нет ни видеокарты, ни весов.
 """
 import base64
+import contextlib
 import gc
 import io
 import hashlib
@@ -170,6 +171,33 @@ def _load():
 
     _PIPES["t2i"], _PIPES["i2i"] = t2i, i2i
     return t2i, i2i
+
+
+@contextlib.contextmanager
+def _correlated_noise(mem):
+    """На время ОДНОГО вызова i2i петли шум берётся из `mem` (motion.NoiseMemory):
+    начальный шум img2img и шум между шагами LCM — оба через randn_tensor своих
+    модулей. mem None — ничего не трогаем (прежнее поведение побайтно)."""
+    if mem is None:
+        yield
+        return
+    import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as _p
+    import diffusers.schedulers.scheduling_lcm as _l
+    orig_p, orig_l = _p.randn_tensor, _l.randn_tensor
+
+    def _p_randn(*a, **k):
+        return mem.mix(orig_p(*a, **k))
+
+    def _l_randn(*a, **k):
+        return mem.mix(orig_l(*a, **k))
+
+    _p.randn_tensor, _l.randn_tensor = _p_randn, _l_randn
+    mem.begin()
+    try:
+        yield
+    finally:
+        _p.randn_tensor, _l.randn_tensor = orig_p, orig_l
+        mem.end()
 
 
 def _steps_for(strength: float) -> int:
@@ -786,6 +814,13 @@ def handler(event):
     if not (0.0 <= key_anchor <= 0.8):
         return {"error": "bad_params"}
 
+    # Шум петли, меняющийся медленно (05.11.2026, «мерцание кадров»):
+    # motion.NoiseMemory. 0 / нет поля — свежий шум на каждый кадр, как было.
+    try:
+        noise_rho = motion.parse_noise_rho(inp.get("noise_rho"))
+    except (TypeError, ValueError):
+        return {"error": "bad_params"}
+
     mark = bool(inp.get("mark", True))
     seed = inp.get("seed")
     seed = int(seed) if seed is not None else int(time.time()) & 0x7FFFFFFF
@@ -891,6 +926,7 @@ def handler(event):
 
     t2i, i2i = _load()
     t_first = t_loop = t_interp = 0.0
+    noise = motion.NoiseMemory(noise_rho) if noise_rho > 0 else None
     anchor = None                                  # (ключевой кадр, суммарная матрица камеры) сцены
     ref = None
     per_frame = []
@@ -942,6 +978,8 @@ def handler(event):
                     t_first += time.time() - ts
                     cur = np.array(img)
                     ref = _lab_stats(cur)          # цветовой якорь СВОЙ у каждого шота
+                    if noise is not None:
+                        noise.reset()              # шум сцены начинается заново
                     # Якорь сцены — её ключевой кадр, сдвинутый тем же суммарным
                     # движением камеры (key_anchor > 0 и только у сцен с ключевым кадром).
                     anchor = (cur.copy(), np.eye(3)) if (key_anchor > 0 and i in keyframes) else None
@@ -966,10 +1004,11 @@ def handler(event):
                                        flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT_101)
                     moved = ((1 - key_anchor) * moved.astype(np.float32)
                              + key_anchor * k.astype(np.float32)).clip(0, 255).astype(np.uint8)
-                out = i2i(prompt=frame_prompts[i], negative_prompt=NEG,
-                          image=Image.fromarray(moved), strength=curves["strength"][i],
-                          num_inference_steps=curves["steps"][i], guidance_scale=1.5,
-                          generator=g).images[0]
+                with _correlated_noise(noise):
+                    out = i2i(prompt=frame_prompts[i], negative_prompt=NEG,
+                              image=Image.fromarray(moved), strength=curves["strength"][i],
+                              num_inference_steps=curves["steps"][i], guidance_scale=1.5,
+                              generator=g).images[0]
                 cur = _color_match(np.array(out), ref)
                 if double:
                     tm = time.time()
@@ -1013,6 +1052,7 @@ def handler(event):
         # разные числа, и приложение подписывает результат по этому полю.
         "width": (out_size[0] if out_size else width), "height": (out_size[1] if out_size else height),
         "render_width": width, "render_height": height, "fps": fps,
+        "noise_rho": noise_rho,
         # Сид уезжает наружу ради «того же образа»: без него повторный прогон
         # рисует другой мир, и клип нельзя доработать, только переиграть.
         "seed": seed,

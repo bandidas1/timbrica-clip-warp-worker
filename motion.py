@@ -320,6 +320,66 @@ def step_matrix(w, h, zoom, angle, tx, ty):
     return m
 
 
+NOISE_RHO_MAX = 0.97
+
+
+class NoiseMemory:
+    """Шум петли, меняющийся МЕДЛЕННО: AR(1) по номеру вызова шума внутри кадра.
+
+    Почему (баг-репорт 05.11.2026 «идиотское мерцание кадров»): каждый кадр
+    петли — img2img с силой ~0.5, и каждый кадр брал СВЕЖИЙ шум. Текстура
+    перерисовывалась заново 12 раз в секунду — «кипела»: средняя разница
+    соседних кадров 13–15 из 255 при спокойной камере. Сила перерисовки тут не
+    рычаг (замер на прод-эндпоинте: 0.52 / 0.364 / 0.30 → дрожь 13.4 / 14.5 /
+    13.6): число эффективных шагов держится, а шум всё равно новый.
+
+    Здесь i-й вызов шума кадра t = rho · (i-й вызов кадра t−1) + sqrt(1 − rho²) ·
+    свежий: дисперсия та же (шум остаётся гауссовым N(0,1)), соседние кадры
+    коррелируют на rho. Сцена начинается со свежего (reset). Замер на настоящем
+    handler.py (3 сцены × 5 с, тот же сид): rho 0.9 — «кипение» 10.8 → 7.7,
+    дрожь 13.7 → 11.1, чёткость 118 → 171; rho 1 (один шум на всю сцену) — 5.0,
+    но шум копится в блоки сетки латентов (огни квадратами) — поэтому не 1.
+
+    Работает с любыми тензорами, у которых есть *, + и .shape (torch, numpy).
+    """
+
+    def __init__(self, rho):
+        self.rho = float(rho)
+        self.prev = []
+        self.cur = []
+        self.k = 0
+
+    def reset(self):
+        self.prev, self.cur, self.k = [], [], 0
+
+    def begin(self):
+        self.cur, self.k = [], 0
+
+    def end(self):
+        self.prev = self.cur
+
+    def mix(self, fresh):
+        k = self.k
+        self.k += 1
+        p = self.prev[k] if k < len(self.prev) else None
+        if (p is not None and tuple(p.shape) == tuple(fresh.shape)
+                and getattr(p, "dtype", None) == getattr(fresh, "dtype", None)
+                and getattr(p, "device", None) == getattr(fresh, "device", None)):
+            fresh = self.rho * p + math.sqrt(1.0 - self.rho * self.rho) * fresh
+        self.cur.append(fresh)
+        return fresh
+
+
+def parse_noise_rho(raw):
+    """0 (нет поля) — прежний свежий шум, побайтно как было. Иначе 0 < rho ≤ 0.97."""
+    if raw is None:
+        return 0.0
+    rho = float(raw)
+    if not (0.0 <= rho <= NOISE_RHO_MAX) or rho != rho:
+        raise ValueError("noise_rho")
+    return rho
+
+
 def half_affine(w, h, zoom, angle, tx, ty):
     """A такая, что A∘A = шаг петли M (точный квадратный корень, не «половина
     чисел»). Линейная часть подобия: sqrt(zoom) и angle/2 — у подобий это

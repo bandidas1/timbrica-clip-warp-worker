@@ -217,10 +217,64 @@ def test_half_affine():
         print("  (cv2 нет — сверка с getRotationMatrix2D пропущена)")
 
 
+def test_noise_memory():
+    """AR(1)-шум петли (05.11.2026): дисперсия та же, соседние кадры коррелируют на rho,
+    сцена начинается со свежего, rho 0 — тот же свежий шум (прежнее поведение)."""
+    import random
+
+    class V(list):
+        """Минимальный «тензор»: .shape, *, + — как у torch и numpy."""
+        @property
+        def shape(self):
+            return (len(self),)
+
+        def __mul__(self, k):
+            return V(x * k for x in self)
+        __rmul__ = __mul__
+
+        def __add__(self, o):
+            return V(a + b for a, b in zip(self, o))
+
+    rnd = random.Random(5)
+    fresh = lambda n=4000: V(rnd.gauss(0, 1) for _ in range(n))
+    m = M.NoiseMemory(0.9)
+    frames = []
+    for t in range(3):
+        m.begin()
+        a = m.mix(fresh())        # начальный шум img2img
+        b = m.mix(fresh())        # шум между шагами LCM
+        m.end()
+        frames.append((a, b))
+    var = sum(x * x for x in frames[2][0]) / len(frames[2][0])
+    check(abs(var - 1.0) < 0.08, "дисперсия AR-шума уехала: %.3f" % var)
+    corr = lambda u, v: sum(x * y for x, y in zip(u, v)) / len(u)
+    check(abs(corr(frames[1][0], frames[0][0]) - 0.9) < 0.05, "соседние кадры коррелируют не на rho (вызов 0)")
+    check(abs(corr(frames[1][1], frames[0][1]) - 0.9) < 0.05, "соседние кадры коррелируют не на rho (вызов 1)")
+    check(abs(corr(frames[1][0], frames[0][1])) < 0.08, "вызовы кадра смешались между собой")
+    m.reset()
+    m.begin()
+    c = m.mix(fresh())
+    m.end()
+    check(abs(corr(c, frames[2][0])) < 0.08, "сцена после reset не начинается со свежего шума")
+    # другая форма (другой размер кадра) — свежий шум, а не ошибка
+    m.begin()
+    d = m.mix(fresh(100))
+    m.end()
+    check(len(d) == 100, "другая форма не прошла")
+    check(M.parse_noise_rho(None) == 0.0, "нет поля — не 0")
+    for bad in (-0.1, 0.98, 1.0, float("nan")):
+        try:
+            M.parse_noise_rho(bad)
+            check(False, "noise_rho %r принят" % bad)
+        except ValueError:
+            pass
+    check(M.parse_noise_rho(0.9) == 0.9, "0.9 не принят")
+
+
 def main():
     for t in (_styles_match, test_off_is_identical, test_on_keeps_the_budget,
               test_hits_are_peaks, test_strength_band_and_gpu_cost, test_inputs,
-              test_half_affine):
+              test_half_affine, test_noise_memory):
         n = len(FAILS)
         t()
         print("%s %s" % ("ok  " if len(FAILS) == n else "FAIL", t.__name__))

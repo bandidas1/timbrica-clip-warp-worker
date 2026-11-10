@@ -271,10 +271,43 @@ def test_noise_memory():
     check(M.parse_noise_rho(0.9) == 0.9, "0.9 не принят")
 
 
+def test_zoom_budget():
+    # нет поля — те же кривые (тот же объект)
+    st = STYLES["flow"]
+    total, starts = 216, [0, 72, 144]
+    c = M.motion_curves(total, 12, st, shot_starts=starts)
+    check(M.cap_scene_travel(c, total, starts, None) is c, "без потолка кривые не те же")
+    capped = M.cap_scene_travel(c, total, starts, 1.35)
+    for a, b in ((0, 72), (72, 144), (144, 216)):
+        cum = math.prod(capped["zoom"][i] for i in range(a + 1, b))
+        check(abs(cum - 1.35) < 1e-6, "сцена %d: накопленный зум %.4f, ждали 1.35" % (a, cum))
+        old = math.prod(c["zoom"][i] for i in range(a + 1, b))
+        k = math.log(1.35) / math.log(old)
+        check(abs(capped["angle"][a + 5] - st["angle"] * k) < 1e-9, "поворот не той же долей")
+        check(capped["zoom"][a] == c["zoom"][a], "кадр старта сцены тронут")
+    check(capped["strength"] == c["strength"] and capped["steps"] == c["steps"], "сила/шаги тронуты")
+    # короткая сцена в пределах потолка — как была
+    short = M.motion_curves(30, 12, st, shot_starts=[0])
+    same = M.cap_scene_travel(short, 30, [0], 2.0)
+    check(same["zoom"] == short["zoom"], "сцена в пределах потолка изменилась")
+    # пульс под музыку: потолок держится и с ним
+    e, hits = song(total)
+    cr = M.cap_scene_travel(M.motion_curves(total, 12, st, 0.7, e, hits, starts), total, starts, 1.5)
+    for a, b in ((0, 72), (72, 144), (144, 216)):
+        check(math.prod(cr["zoom"][i] for i in range(a + 1, b)) <= 1.5 + 1e-6, "пульс вышел за потолок")
+    for bad in (1.0, 0.9, 5, float("nan"), "x"):
+        try:
+            M.parse_zoom_budget(bad)
+            check(False, "zoom_budget %r принят" % (bad,))
+        except (ValueError, TypeError):
+            pass
+    check(M.parse_zoom_budget(None) is None and M.parse_zoom_budget(1.35) == 1.35, "разбор zoom_budget")
+
+
 def main():
     for t in (_styles_match, test_off_is_identical, test_on_keeps_the_budget,
               test_hits_are_peaks, test_strength_band_and_gpu_cost, test_inputs,
-              test_half_affine, test_noise_memory):
+              test_half_affine, test_noise_memory, test_zoom_budget):
         n = len(FAILS)
         t()
         print("%s %s" % ("ok  " if len(FAILS) == n else "FAIL", t.__name__))

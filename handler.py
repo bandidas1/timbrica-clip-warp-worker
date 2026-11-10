@@ -821,6 +821,13 @@ def handler(event):
     except (TypeError, ValueError):
         return {"error": "bad_params"}
 
+    # Потолок наезда камеры на сцену (10.11.2026, motion.cap_scene_travel):
+    # нет поля — движение как было, побайтно.
+    try:
+        zoom_budget = motion.parse_zoom_budget(inp.get("zoom_budget"))
+    except (TypeError, ValueError):
+        return {"error": "bad_params"}
+
     mark = bool(inp.get("mark", True))
     seed = inp.get("seed")
     seed = int(seed) if seed is not None else int(time.time()) & 0x7FFFFFFF
@@ -923,6 +930,7 @@ def handler(event):
     # стиля (те же объекты float), то есть побайтно прежний ролик.
     curves = motion.motion_curves(total, fps, mo, react, energy, hits,
                                   shot_starts, EFF_STEPS)
+    curves = motion.cap_scene_travel(curves, total, shot_starts, zoom_budget)
 
     t2i, i2i = _load()
     t_first = t_loop = t_interp = 0.0
@@ -1052,7 +1060,7 @@ def handler(event):
         # разные числа, и приложение подписывает результат по этому полю.
         "width": (out_size[0] if out_size else width), "height": (out_size[1] if out_size else height),
         "render_width": width, "render_height": height, "fps": fps,
-        "noise_rho": noise_rho,
+        "noise_rho": noise_rho, "zoom_budget": zoom_budget,
         # Сид уезжает наружу ради «того же образа»: без него повторный прогон
         # рисует другой мир, и клип нельзя доработать, только переиграть.
         "seed": seed,

@@ -303,6 +303,61 @@ def motion_curves(total, fps, style, react=0.0, energy=None, hits=None,
     }
 
 
+
+# ------------------------------------------- сколько камера проходит за сцену
+# Потолок наезда на СЦЕНУ (10.11.2026, чат 213 — «первые кадры совпали с
+# описанием, потом импровизация; лишние руки, ноги, люди»). Зум стиля — на
+# КАДР: flow 1.018 при 12 к/с за сцену 6 с даёт 1.018^72 ≈ ×3.6, то есть к концу
+# сцены в кадре остаётся центральные ~8 % площади ключевого кадра. Человек
+# уезжает за край, петля дорисовывает увеличенный клочок — колено, руку, край
+# раковины. Пока сцены не начинались с ключевого кадра (до 04.11), это и было
+# «полётом» стиля; с кадром FLUX сцена обязана оставаться сценой.
+# Потолок — общий множитель k ≤ 1 на ВСЁ движение сцены (лог-зум, поворот,
+# сдвиг): характер камеры тот же, она лишь медленнее в длинной сцене.
+ZOOM_BUDGET_MIN = 1.0
+ZOOM_BUDGET_MAX = 4.0
+
+
+def parse_zoom_budget(raw):
+    """None (нет поля) — без потолка, побайтно как было. Иначе 1 < b ≤ 4."""
+    if raw is None:
+        return None
+    b = float(raw)
+    if b != b or not (ZOOM_BUDGET_MIN < b <= ZOOM_BUDGET_MAX):
+        raise ValueError("zoom_budget")
+    return b
+
+
+def cap_scene_travel(curves, total, shot_starts, budget):
+    """Новые кривые: накопленный зум каждой сцены не выше `budget`.
+
+    Сцена — кадры от её старта до следующего; кадр старта рисуется заново, его
+    значения не трогаются. Лог-зум, поворот и сдвиг сцены, вышедшей за потолок,
+    умножаются на k = ln(budget) / Σ|ln zoom|; сцена в пределах — как была.
+    Сила и шаги не меняются (они — о перерисовке, не о камере).
+    """
+    if budget is None:
+        return curves
+    lim = math.log(budget)
+    starts = sorted(set(int(s) for s in shot_starts if 0 <= s < total)) or [0]
+    if starts[0] != 0:
+        starts = [0] + starts
+    out = {k: list(v) for k, v in curves.items()}
+    bounds = starts + [total]
+    for a, b in zip(bounds, bounds[1:]):
+        loop = range(a + 1, b)
+        travel = sum(abs(math.log(out["zoom"][i])) for i in loop if out["zoom"][i] > 0)
+        if travel <= lim or travel <= 0:
+            continue
+        k = lim / travel
+        for i in loop:
+            z = out["zoom"][i]
+            out["zoom"][i] = math.exp(k * math.log(z)) if z > 0 else z
+            out["angle"][i] = out["angle"][i] * k
+            out["tx"][i] = out["tx"][i] * k
+            out["ty"][i] = out["ty"][i] * k
+    return out
+
 # ------------------------------------------------- середина известного шага
 def rotation_matrix(cx, cy, angle_deg, scale):
     """То же, что cv2.getRotationMatrix2D, — без cv2 (для самопроверки)."""
